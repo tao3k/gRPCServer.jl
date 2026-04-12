@@ -1,6 +1,7 @@
 # Unit tests for GRPCServer lifecycle
 
 using Test
+using Sockets
 using gRPCServer
 
 @testset "GRPCServer Unit Tests" begin
@@ -110,5 +111,59 @@ using gRPCServer
 
         # Verify interceptors are registered (indirectly through dispatcher)
         @test length(server.dispatcher.interceptor_chain) == 1
+    end
+
+    @testset "Live bidi frame pump dispatches sibling streams without consuming active stream" begin
+        server = GRPCServer("0.0.0.0", 50051; enable_health_check=true)
+        gRPCServer.register_builtin_services!(server)
+
+        conn = gRPCServer.HTTP2Connection()
+        conn.state = gRPCServer.ConnectionState.OPEN
+        peer = gRPCServer.PeerInfo(ip"127.0.0.1", 50051)
+
+        function seed_health_check_stream(
+            conn::gRPCServer.HTTP2Connection,
+            stream_id::UInt32;
+            buffered_request::Union{Nothing, Vector{UInt8}}=nothing,
+            end_stream_on_headers::Bool=false,
+        )
+            stream = gRPCServer.create_stream(conn, stream_id)
+            stream.request_headers = [
+                (":path", "/grpc.health.v1.Health/Check"),
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+            ]
+            stream.headers_complete = true
+            gRPCServer.receive_headers!(stream, end_stream_on_headers)
+            if buffered_request !== nothing
+                write(stream.data_buffer, buffered_request)
+            end
+            return stream
+        end
+
+        request_bytes = gRPCServer.encode_grpc_message(
+            gRPCServer.serialize_message(gRPCServer.HealthCheckRequest(""));
+            compressed=false,
+        )
+
+        active_stream =
+            seed_health_check_stream(conn, UInt32(1); buffered_request=request_bytes)
+        sibling_stream = seed_health_check_stream(conn, UInt32(3))
+
+        io = IOBuffer()
+        sibling_frame = gRPCServer.data_frame(3, request_bytes; end_stream=true)
+        gRPCServer.process_incoming_frame!(
+            server,
+            conn,
+            io,
+            peer,
+            sibling_frame;
+            exclude_stream_id=UInt32(1),
+        )
+
+        @test gRPCServer.get_stream(conn, UInt32(1)) === active_stream
+        @test gRPCServer.has_complete_grpc_message(active_stream)
+        @test gRPCServer.get_stream(conn, UInt32(3)) === nothing
+        @test !isempty(take!(io))
     end
 end

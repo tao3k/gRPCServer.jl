@@ -422,13 +422,36 @@ function receive_data!(receiver::DataReceiver, stream_id::UInt32, frame::Frame):
         throw(ErrorException("Frame size exceeds maximum: $(frame.header.length) > $(receiver.max_frame_size)"))
     end
 
+    size = Int(frame.header.length)
+
     # Consume from stream window (receiver perspective - we're receiving, not sending)
-    # The receiver tracks what it has received and will send WINDOW_UPDATE
+    # The receiver tracks what it has received and will send WINDOW_UPDATE.
+    # Exceeding either advertised receive window is a FLOW_CONTROL_ERROR and
+    # must be rejected before payload bytes reach the per-stream buffer.
     stream_window = get_stream_window(receiver.controller, stream_id)
-    if stream_window !== nothing
-        consume!(stream_window, Int(frame.header.length))
+    if stream_window === nothing
+        throw(StreamError(stream_id, ErrorCode.STREAM_CLOSED, "DATA for unknown receive window"))
     end
-    consume!(receiver.controller.connection_window, Int(frame.header.length))
+
+    if !consume!(receiver.controller.connection_window, size)
+        throw(
+            ConnectionError(
+                ErrorCode.FLOW_CONTROL_ERROR,
+                "Connection receive window exceeded by DATA frame on stream $stream_id",
+            ),
+        )
+    end
+
+    if !consume!(stream_window, size)
+        release!(receiver.controller.connection_window, size)
+        throw(
+            StreamError(
+                stream_id,
+                ErrorCode.FLOW_CONTROL_ERROR,
+                "Stream receive window exceeded by DATA frame",
+            ),
+        )
+    end
 
     return frame.payload
 end

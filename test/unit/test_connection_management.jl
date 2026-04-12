@@ -198,6 +198,52 @@ using .ConformanceData
             @test !stream.end_stream_sent
         end
 
+        @testset "Connection receive path rejects stream window overruns before buffering" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = gRPCServer.ConnectionState.OPEN
+            stream = gRPCServer.create_stream(conn, UInt32(1))
+            gRPCServer.receive_headers!(stream, false)
+
+            stream_window =
+                gRPCServer.get_stream_window(conn.recv_flow_controller, UInt32(1))
+            @test stream_window !== nothing
+            stream_window.available = 5
+            stream_window.initial_size = 5
+
+            err = try
+                gRPCServer.process_frame(conn, gRPCServer.data_frame(1, fill(UInt8(0x61), 6)))
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCServer.StreamError
+            @test err.error_code == gRPCServer.ErrorCode.FLOW_CONTROL_ERROR
+            @test bytesavailable(stream.data_buffer) == 0
+            @test gRPCServer.available(conn.recv_flow_controller.connection_window) ==
+                  gRPCServer.DEFAULT_INITIAL_WINDOW_SIZE
+            @test gRPCServer.available(stream_window) == 5
+        end
+
+        @testset "Connection receive path rejects connection window overruns before buffering" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = gRPCServer.ConnectionState.OPEN
+            stream = gRPCServer.create_stream(conn, UInt32(1))
+            gRPCServer.receive_headers!(stream, false)
+
+            conn.recv_flow_controller.connection_window.available = 5
+
+            err = try
+                gRPCServer.process_frame(conn, gRPCServer.data_frame(1, fill(UInt8(0x61), 6)))
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCServer.ConnectionError
+            @test err.error_code == gRPCServer.ErrorCode.FLOW_CONTROL_ERROR
+            @test bytesavailable(stream.data_buffer) == 0
+            @test gRPCServer.available(conn.recv_flow_controller.connection_window) == 5
+        end
+
     end  # T040
 
     # =========================================================================

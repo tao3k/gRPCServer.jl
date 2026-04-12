@@ -596,20 +596,7 @@ function handle_connection(server::GRPCServer, client)
             @debug "Received frame" type=frame.header.frame_type stream_id=frame.header.stream_id length=frame.header.length flags=frame.header.flags
 
             try
-                # Process frame and get response frames
-                response_frames = process_frame(conn, frame)
-
-                @debug "process_frame returned" num_response_frames=length(response_frames)
-
-                # Send response frames
-                for resp_frame in response_frames
-                    @debug "Sending response frame" type=resp_frame.header.frame_type stream_id=resp_frame.header.stream_id
-                end
-                isempty(response_frames) || write_frames(client, response_frames)
-
-                # Check for completed streams (END_STREAM received)
-                @debug "Checking for completed streams"
-                process_completed_streams!(server, conn, client, peer)
+                process_incoming_frame!(server, conn, client, peer, frame)
 
             catch e
                 if e isa ConnectionError
@@ -749,12 +736,16 @@ For unary/server-streaming, waits for END_STREAM.
 For client-streaming/bidi-streaming, processes messages as they arrive.
 """
 function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
-                                    io::IO, peer::PeerInfo)
+                                    io::IO, peer::PeerInfo;
+                                    exclude_stream_id::Union{Nothing, UInt32}=nothing)
     # Get list of stream IDs to process (to avoid modifying dict while iterating)
     streams_to_process = UInt32[]
 
     lock(conn.lock) do
         for (stream_id, stream) in conn.streams
+            if stream_id == exclude_stream_id
+                continue
+            end
             if stream.headers_complete && !stream.reset
                 # Check if we have a complete gRPC message to process
                 if stream.end_stream_received || has_complete_grpc_message(stream)
@@ -791,6 +782,37 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             remove_stream(conn, stream_id)
         end
     end
+end
+
+function process_incoming_frame!(
+    server::GRPCServer,
+    conn::HTTP2Connection,
+    io::IO,
+    peer::PeerInfo,
+    frame::Frame;
+    exclude_stream_id::Union{Nothing, UInt32}=nothing,
+)
+    # Process frame and get response frames
+    response_frames = process_frame(conn, frame)
+
+    @debug "process_frame returned" num_response_frames=length(response_frames)
+
+    # Send response frames
+    for resp_frame in response_frames
+        @debug "Sending response frame" type=resp_frame.header.frame_type stream_id=resp_frame.header.stream_id
+    end
+    isempty(response_frames) || write_frames(io, response_frames)
+
+    # Check for completed streams (END_STREAM received)
+    @debug "Checking for completed streams" exclude_stream_id=exclude_stream_id
+    process_completed_streams!(
+        server,
+        conn,
+        io,
+        peer;
+        exclude_stream_id=exclude_stream_id,
+    )
+    return nothing
 end
 
 """
@@ -1101,13 +1123,19 @@ function handle_server_streaming(
 end
 
 """
-    wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io::IO) -> Bool
+    wait_for_message_or_end(server::GRPCServer, stream::HTTP2Stream, conn::HTTP2Connection, io::IO, peer::PeerInfo) -> Bool
 
 Wait for either a complete gRPC message or end of stream.
 Returns true if message available, false if stream ended.
 Uses polling with yield() to allow other tasks to run.
 """
-function wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io::IO)::Bool
+function wait_for_message_or_end(
+    server::GRPCServer,
+    stream::HTTP2Stream,
+    conn::HTTP2Connection,
+    io::IO,
+    peer::PeerInfo,
+)::Bool
     max_iterations = 10000  # Safety limit
     iteration = 0
 
@@ -1137,8 +1165,14 @@ function wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io:
             # Try to read and process any waiting frames
             frame = try_read_frame(io, conn)
             if frame !== nothing
-                response_frames = process_frame(conn, frame)
-                isempty(response_frames) || write_frames(io, response_frames)
+                process_incoming_frame!(
+                    server,
+                    conn,
+                    io,
+                    peer,
+                    frame;
+                    exclude_stream_id=stream.id,
+                )
             end
         catch e
             if !(e isa EOFError)
@@ -1223,7 +1257,7 @@ function handle_bidi_streaming_live(
                     return nothing
                 end
 
-                wait_for_message_or_end(stream, conn, io) || return nothing
+                wait_for_message_or_end(server, stream, conn, io, ctx.peer) || return nothing
             end
         end
 

@@ -578,8 +578,8 @@ function handle_connection(server::GRPCServer, client)
         # Send server preface (SETTINGS frame)
         for frame in response_frames
             @debug "Sending frame" type=frame.header.frame_type length=frame.header.length
-            write_frame(client, frame)
         end
+        isempty(response_frames) || write_frames(client, response_frames)
 
         @debug "Server SETTINGS sent, starting frame processing loop"
 
@@ -604,8 +604,8 @@ function handle_connection(server::GRPCServer, client)
                 # Send response frames
                 for resp_frame in response_frames
                     @debug "Sending response frame" type=resp_frame.header.frame_type stream_id=resp_frame.header.stream_id
-                    write_frame(client, resp_frame)
                 end
+                isempty(response_frames) || write_frames(client, response_frames)
 
                 # Check for completed streams (END_STREAM received)
                 @debug "Checking for completed streams"
@@ -800,17 +800,38 @@ Check if the stream has at least one complete gRPC message in its buffer.
 gRPC messages are length-prefixed: 1 byte compressed flag + 4 bytes length + message.
 """
 function has_complete_grpc_message(stream::HTTP2Stream)::Bool
-    data = peek_data(stream)
-    if length(data) < 5
+    io = stream.data_buffer
+    available = io.size - stream.data_offset + 1
+    if available < 5
         return false
     end
 
     # Parse message length (big-endian)
-    msg_len = (UInt32(data[2]) << 24) | (UInt32(data[3]) << 16) |
-              (UInt32(data[4]) << 8) | UInt32(data[5])
+    data = io.data
+    offset = stream.data_offset
+    msg_len = (UInt32(data[offset + 1]) << 24) | (UInt32(data[offset + 2]) << 16) |
+              (UInt32(data[offset + 3]) << 8) | UInt32(data[offset + 4])
 
     # Check if we have the full message
-    return length(data) >= 5 + msg_len
+    return available >= 5 + msg_len
+end
+
+function compact_grpc_buffer!(stream::HTTP2Stream)
+    io = stream.data_buffer
+    if stream.data_offset <= 1
+        return nothing
+    end
+    if stream.data_offset > io.size
+        take!(io)
+        stream.data_offset = 1
+        return nothing
+    end
+
+    unread = Vector{UInt8}(view(io.data, stream.data_offset:io.size))
+    take!(io)
+    stream.data_offset = 1
+    write(io, unread)
+    return nothing
 end
 
 """
@@ -823,32 +844,30 @@ gRPC messages are length-prefixed: 1 byte compressed flag + 4 bytes length + mes
 Handles decompression if the compressed flag is set and grpc-encoding header is present.
 """
 function read_grpc_message!(stream::HTTP2Stream)::Union{Vector{UInt8}, Nothing}
-    data = take!(stream.data_buffer)
-    if length(data) < 5
-        # Put data back if incomplete
-        write(stream.data_buffer, data)
+    io = stream.data_buffer
+    available = io.size - stream.data_offset + 1
+    if available < 5
         return nothing
     end
 
     # Parse compressed flag and message length (big-endian)
-    compressed = data[1] != 0x00
-    msg_len = (UInt32(data[2]) << 24) | (UInt32(data[3]) << 16) |
-              (UInt32(data[4]) << 8) | UInt32(data[5])
+    data = io.data
+    offset = stream.data_offset
+    compressed = data[offset] != 0x00
+    msg_len = (UInt32(data[offset + 1]) << 24) | (UInt32(data[offset + 2]) << 16) |
+              (UInt32(data[offset + 3]) << 8) | UInt32(data[offset + 4])
 
     total_msg_size = 5 + Int(msg_len)
-    if length(data) < total_msg_size
-        # Put data back if incomplete
-        write(stream.data_buffer, data)
+    if available < total_msg_size
         return nothing
     end
 
     # Extract message
-    message = data[6:total_msg_size]
-
-    # Put remaining data back in buffer
-    if length(data) > total_msg_size
-        write(stream.data_buffer, data[(total_msg_size + 1):end])
-    end
+    message_start = offset + 5
+    message_stop = offset + total_msg_size - 1
+    message = Vector{UInt8}(view(data, message_start:message_stop))
+    stream.data_offset += total_msg_size
+    compact_grpc_buffer!(stream)
 
     # Handle decompression if compressed flag is set
     if compressed
@@ -931,6 +950,11 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
         if service.name == "grpc.reflection.v1alpha.ServerReflection"
             bidi_ctx = create_server_context(stream, peer, method_path)
             handle_bidi_streaming_incremental(server, conn, io, stream, bidi_ctx, method_desc, service)
+            return
+        end
+        if service.name == "arrow.flight.protocol.FlightService"
+            bidi_ctx = create_server_context(stream, peer, method_path)
+            handle_bidi_streaming_live(server, conn, io, stream, bidi_ctx, method_desc, service)
             return
         end
         # User-defined bidi streaming handlers need batch mode - wait for END_STREAM
@@ -1113,7 +1137,8 @@ function wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io:
             # Try to read and process any waiting frames
             frame = try_read_frame(io, conn)
             if frame !== nothing
-                process_frame!(conn, frame)
+                response_frames = process_frame(conn, frame)
+                isempty(response_frames) || write_frames(io, response_frames)
             end
         catch e
             if !(e isa EOFError)
@@ -1148,6 +1173,125 @@ function try_read_frame(io::IO, conn::HTTP2Connection)::Union{Frame, Nothing}
             return nothing
         end
         rethrow()
+    end
+end
+
+"""
+    handle_bidi_streaming_live(server, conn, io, stream, ctx, method_desc, service)
+
+Handle a bidirectional streaming RPC without waiting for END_STREAM up front.
+Arrow Flight `DoExchange` relies on this behavior because clients may expect
+response progress while the request side is still open.
+"""
+function handle_bidi_streaming_live(
+    server::GRPCServer,
+    conn::HTTP2Connection,
+    io::IO,
+    stream::HTTP2Stream,
+    ctx::ServerContext,
+    method_desc::MethodDescriptor,
+    _service::ServiceDescriptor,
+)
+    if !can_send(stream)
+        @warn "Cannot start live bidi streaming, stream not in sendable state" stream_id=stream.id state=stream.state
+        return
+    end
+
+    response_content_type = get_response_content_type(stream)
+    response_headers = [
+        (":status", "200"),
+        ("content-type", response_content_type),
+        ("grpc-encoding", "identity"),
+    ]
+    header_frames = send_headers(conn, stream.id, response_headers; end_stream=false)
+    write_frames(io, header_frames)
+
+    final_status = StatusCode.OK
+    final_message = ""
+    trailers_sent = Ref(false)
+
+    try
+        receive_callback = function()
+            while true
+                if has_complete_grpc_message(stream)
+                    msg_data = read_grpc_message!(stream)
+                    msg_data === nothing && continue
+                    return deserialize_message(msg_data, method_desc.input_type)
+                end
+
+                if stream.end_stream_received || stream.state == StreamState.CLOSED
+                    return nothing
+                end
+
+                wait_for_message_or_end(stream, conn, io) || return nothing
+            end
+        end
+
+        send_callback = function(message, _compress)
+            if trailers_sent[]
+                @warn "Attempted to send message after live bidi stream closed" stream_id=stream.id
+                return
+            end
+            response_data = serialize_message(message)
+            grpc_message = encode_grpc_message(response_data; compressed=false)
+            data_frames = send_data(conn, stream.id, grpc_message; end_stream=false)
+            write_frames(io, data_frames)
+        end
+
+        close_callback = function()
+            if trailers_sent[]
+                return
+            end
+            trailers_sent[] = true
+            trailers = [
+                ("grpc-status", string(Int(final_status))),
+            ]
+            if !isempty(final_message)
+                push!(trailers, ("grpc-message", final_message))
+            end
+            trailer_frames = send_trailers(conn, stream.id, trailers)
+            write_frames(io, trailer_frames)
+        end
+
+        is_cancelled_callback = function()
+            return ctx.cancelled || stream.state == StreamState.CLOSED
+        end
+
+        status, message = dispatch_bidi_streaming(
+            server.dispatcher,
+            ctx,
+            receive_callback,
+            send_callback,
+            close_callback,
+            is_cancelled_callback,
+        )
+
+        final_status = status
+        final_message = message
+    catch e
+        if e isa GRPCError
+            final_status = e.code
+            final_message = e.message
+        elseif e isa StreamCancelledError
+            final_status = StatusCode.CANCELLED
+            final_message = "Stream cancelled"
+        else
+            @error "Error in live bidi streaming handler" exception=(e, catch_backtrace())
+            final_status = StatusCode.INTERNAL
+            final_message = server.dispatcher.debug_mode ? sprint(showerror, e) : "Internal server error"
+        end
+    end
+
+    if !trailers_sent[]
+        trailers_sent[] = true
+        trailers = [
+            ("grpc-status", string(Int(final_status))),
+        ]
+        if !isempty(final_message)
+            push!(trailers, ("grpc-message", final_message))
+        end
+        trailer_frames = send_trailers(conn, stream.id, trailers)
+        write_frames(io, trailer_frames)
     end
 end
 

@@ -210,7 +210,7 @@ using gRPCServer
         data1 = UInt8[1, 2, 3, 4, 5]
         initial_window = stream.recv_window
         gRPCServer.receive_data!(stream, data1, false)
-        @test stream.recv_window == initial_window - length(data1)
+        @test stream.recv_window == initial_window
         @test stream.state == gRPCServer.StreamState.OPEN
         @test stream.end_stream_received == false
 
@@ -225,13 +225,16 @@ using gRPCServer
         @test all_data == UInt8[1, 2, 3, 4, 5, 6, 7, 8]
     end
 
-    @testset "receive_data! Flow Control Error" begin
+    @testset "receive_data! delegates flow control to connection receiver" begin
         stream = gRPCServer.HTTP2Stream(1, 10)  # Small window
         gRPCServer.receive_headers!(stream, false)
 
-        # Data larger than window should throw
+        # Connection-level validation already owns inbound flow control; the
+        # per-stream buffer should accept bytes once they have passed that gate.
         large_data = UInt8[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        @test_throws gRPCServer.StreamError gRPCServer.receive_data!(stream, large_data, false)
+        gRPCServer.receive_data!(stream, large_data, false)
+        @test gRPCServer.peek_data(stream) == large_data
+        @test stream.recv_window == 10
     end
 
     @testset "receive_data! Invalid State" begin

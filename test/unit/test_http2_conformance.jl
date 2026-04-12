@@ -309,6 +309,54 @@ using .ConformanceData
             @test_throws ArgumentError gRPCServer.window_update_frame(0, 0)
         end
 
+        @testset "Large DATA consumption emits connection and stream WINDOW_UPDATE frames" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = gRPCServer.ConnectionState.OPEN
+            stream = gRPCServer.create_stream(conn, UInt32(1))
+            gRPCServer.receive_headers!(stream, false)
+
+            response_frames = gRPCServer.Frame[]
+            for payload in (zeros(UInt8, 16_000), zeros(UInt8, 16_000), zeros(UInt8, 8_000))
+                append!(response_frames, gRPCServer.process_frame(conn, gRPCServer.data_frame(1, payload)))
+            end
+
+            window_updates =
+                filter(f -> f.header.frame_type == gRPCServer.FrameType.WINDOW_UPDATE, response_frames)
+            @test length(window_updates) == 2
+            @test Set(frame.header.stream_id for frame in window_updates) == Set([UInt32(0), UInt32(1)])
+            @test all(gRPCServer.parse_window_update_frame(update) == 40_000 for update in window_updates)
+        end
+
+        @testset "Send-side WINDOW_UPDATE does not suppress receive-side stream updates" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = gRPCServer.ConnectionState.OPEN
+            stream = gRPCServer.create_stream(conn, UInt32(1))
+            gRPCServer.receive_headers!(stream, false)
+
+            for payload in (zeros(UInt8, 16_000), zeros(UInt8, 16_000))
+                gRPCServer.process_frame(conn, gRPCServer.data_frame(1, payload))
+            end
+
+            gRPCServer.process_frame(conn, gRPCServer.window_update_frame(1, 4_096))
+
+            response_frames = gRPCServer.Frame[]
+            for payload in (zeros(UInt8, 16_000), zeros(UInt8, 16_000), zeros(UInt8, 767))
+                append!(response_frames, gRPCServer.process_frame(conn, gRPCServer.data_frame(1, payload)))
+            end
+
+            window_updates =
+                filter(f -> f.header.frame_type == gRPCServer.FrameType.WINDOW_UPDATE, response_frames)
+            @test length(window_updates) == 2
+            @test Set(frame.header.stream_id for frame in window_updates) == Set([UInt32(0), UInt32(1)])
+            @test all(gRPCServer.parse_window_update_frame(update) == 48_000 for update in window_updates)
+            @test gRPCServer.available(conn.recv_flow_controller.connection_window) == 48_768
+            @test gRPCServer.available(gRPCServer.get_stream_window(conn.recv_flow_controller, UInt32(1))) ==
+                  48_768
+            @test gRPCServer.available(conn.send_flow_controller.connection_window) == 65_535
+            @test gRPCServer.available(gRPCServer.get_stream_window(conn.send_flow_controller, UInt32(1))) ==
+                  69_631
+        end
+
     end
 
     # =========================================================================

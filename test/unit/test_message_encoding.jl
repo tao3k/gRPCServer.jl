@@ -5,6 +5,24 @@
 using Test
 using gRPCServer
 
+mutable struct CountingIO <: IO
+    inner::IOBuffer
+    write_count::Int
+    flush_count::Int
+end
+
+CountingIO() = CountingIO(IOBuffer(), 0, 0)
+
+function Base.write(io::CountingIO, data::StridedVector{UInt8})
+    io.write_count += 1
+    return write(io.inner, data)
+end
+
+function Base.flush(io::CountingIO)
+    io.flush_count += 1
+    return nothing
+end
+
 # Include test utilities if not already loaded
 if !isdefined(@__MODULE__, :TestUtils)
     include("../TestUtils.jl")
@@ -201,6 +219,68 @@ using .ConformanceData
         end
 
     end  # T025
+
+    @testset "T025b: Incremental buffering does not require full-buffer copies" begin
+
+        @testset "Large chunked message becomes readable only after final frame" begin
+            payload = Vector{UInt8}(codeunits(repeat("package Modelica.Blocks;\n", 16_384)))
+            message = TestUtils.build_grpc_message(payload)
+
+            stream = gRPCServer.HTTP2Stream(1, length(message) + 1024)
+            gRPCServer.receive_headers!(stream, false)
+
+            split_point = 16_384
+            gRPCServer.receive_data!(stream, message[1:split_point], false)
+            @test gRPCServer.has_complete_grpc_message(stream) == false
+            @test gRPCServer.read_grpc_message!(stream) === nothing
+
+            gRPCServer.receive_data!(stream, message[(split_point + 1):end], true)
+            @test gRPCServer.has_complete_grpc_message(stream) == true
+            decoded = gRPCServer.read_grpc_message!(stream)
+            @test decoded == payload
+        end
+
+        @testset "Sequential chunked messages preserve unread remainder" begin
+            payload_a = Vector{UInt8}(codeunits(repeat("source_text_a\n", 8_192)))
+            payload_b = Vector{UInt8}(codeunits(repeat("source_text_b\n", 2_048)))
+            message_a = TestUtils.build_grpc_message(payload_a)
+            message_b = TestUtils.build_grpc_message(payload_b)
+            combined = vcat(message_a, message_b)
+
+            stream = gRPCServer.HTTP2Stream(3, length(combined) + 1024)
+            gRPCServer.receive_headers!(stream, false)
+
+            first_chunk = length(message_a) - 128
+            second_chunk = length(message_a) + 256
+            gRPCServer.receive_data!(stream, combined[1:first_chunk], false)
+            @test gRPCServer.has_complete_grpc_message(stream) == false
+
+            gRPCServer.receive_data!(stream, combined[(first_chunk + 1):second_chunk], false)
+            @test gRPCServer.has_complete_grpc_message(stream) == true
+            @test gRPCServer.read_grpc_message!(stream) == payload_a
+
+            gRPCServer.receive_data!(stream, combined[(second_chunk + 1):end], true)
+            @test gRPCServer.has_complete_grpc_message(stream) == true
+            @test gRPCServer.read_grpc_message!(stream) == payload_b
+            @test isempty(gRPCServer.peek_data(stream))
+        end
+    end
+
+    @testset "T025c: Batched frame writes flush once per response group" begin
+        frame_a = gRPCServer.settings_frame()
+        frame_b = gRPCServer.ping_frame()
+
+        io = CountingIO()
+        gRPCServer.write_frames(io, [frame_a, frame_b])
+        @test io.write_count == 2
+        @test io.flush_count == 1
+
+        io_single = CountingIO()
+        gRPCServer.write_frame(io_single, frame_a)
+        gRPCServer.write_frame(io_single, frame_b)
+        @test io_single.write_count == 2
+        @test io_single.flush_count == 2
+    end
 
     # =========================================================================
     # T026: Compression Codec Integration

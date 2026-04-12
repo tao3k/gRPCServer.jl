@@ -182,6 +182,22 @@ using .ConformanceData
             @test frame.header.length == 4
         end
 
+        @testset "Connection send path does not double-consume stream windows" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = gRPCServer.ConnectionState.OPEN
+            stream = gRPCServer.create_stream(conn, UInt32(1))
+            gRPCServer.receive_headers!(stream, false)
+
+            payload = fill(UInt8(0x61), gRPCServer.DEFAULT_INITIAL_WINDOW_SIZE + 1024)
+            frames = gRPCServer.send_data(conn, UInt32(1), payload; end_stream=false)
+
+            @test !isempty(frames)
+            @test sum(Int(frame.header.length) for frame in frames) ==
+                  gRPCServer.DEFAULT_INITIAL_WINDOW_SIZE
+            @test stream.state == gRPCServer.StreamState.OPEN
+            @test !stream.end_stream_sent
+        end
+
     end  # T040
 
     # =========================================================================

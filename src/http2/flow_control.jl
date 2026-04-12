@@ -309,6 +309,7 @@ function generate_window_updates(controller::FlowController;
     if should_send_update(controller.connection_window; threshold_ratio=threshold_ratio)
         increment = get_update_increment(controller.connection_window)
         if increment > 0
+            release!(controller.connection_window, increment)
             push!(frames, window_update_frame(0, increment))
         end
     end
@@ -319,6 +320,7 @@ function generate_window_updates(controller::FlowController;
             if should_send_update(window; threshold_ratio=threshold_ratio)
                 increment = get_update_increment(window)
                 if increment > 0
+                    release!(window, increment)
                     push!(frames, window_update_frame(stream_id, increment))
                 end
             end

@@ -63,6 +63,7 @@ Represents an HTTP/2 stream with state machine and data buffers.
 - `response_headers::Vector{Tuple{String, String}}`: Response headers
 - `trailers::Vector{Tuple{String, String}}`: Trailing headers
 - `data_buffer::IOBuffer`: Accumulated data
+- `data_offset::Int`: First unread byte inside `data_buffer`
 - `headers_complete::Bool`: Whether header block is complete
 - `end_stream_received::Bool`: Whether END_STREAM has been received
 - `end_stream_sent::Bool`: Whether END_STREAM has been sent
@@ -77,6 +78,7 @@ mutable struct HTTP2Stream
     response_headers::Vector{Tuple{String, String}}
     trailers::Vector{Tuple{String, String}}
     data_buffer::IOBuffer
+    data_offset::Int
     headers_complete::Bool
     end_stream_received::Bool
     end_stream_sent::Bool
@@ -93,6 +95,7 @@ mutable struct HTTP2Stream
             Tuple{String, String}[],
             Tuple{String, String}[],
             IOBuffer(),
+            1,
             false,
             false,
             false,
@@ -220,14 +223,10 @@ function receive_data!(stream::HTTP2Stream, data::Vector{UInt8}, end_stream::Boo
             "DATA received in invalid state: $(stream.state)"))
     end
 
-    # Check flow control
-    if length(data) > stream.recv_window
-        throw(StreamError(stream.id, ErrorCode.FLOW_CONTROL_ERROR,
-            "DATA exceeds flow control window"))
-    end
-
-    # Update window and buffer data
-    stream.recv_window -= length(data)
+    # Inbound flow control is enforced by the connection-level receive
+    # controller before payload bytes reach the per-stream buffer. The stream
+    # object only tracks buffer/state transitions here to avoid double-counting
+    # large DATA frames.
     write(stream.data_buffer, data)
 
     if end_stream
@@ -245,19 +244,25 @@ end
 
 Handle sending DATA frame (updates state only, doesn't store data).
 """
-function send_data!(stream::HTTP2Stream, length::Int, end_stream::Bool)
+function send_data!(
+    stream::HTTP2Stream,
+    length::Int,
+    end_stream::Bool;
+    update_flow_control::Bool=true,
+)
     if !can_send(stream)
         throw(StreamError(stream.id, ErrorCode.STREAM_CLOSED,
             "Cannot send DATA in state: $(stream.state)"))
     end
 
-    # Check flow control
-    if length > stream.send_window
-        throw(StreamError(stream.id, ErrorCode.FLOW_CONTROL_ERROR,
-            "DATA exceeds flow control window"))
+    if update_flow_control
+        # Direct stream tests still exercise the legacy per-stream counters.
+        if length > stream.send_window
+            throw(StreamError(stream.id, ErrorCode.FLOW_CONTROL_ERROR,
+                "DATA exceeds flow control window"))
+        end
+        stream.send_window -= length
     end
-
-    stream.send_window -= length
 
     if end_stream
         stream.end_stream_sent = true
@@ -323,7 +328,10 @@ end
 Get accumulated data from the stream buffer.
 """
 function get_data(stream::HTTP2Stream)::Vector{UInt8}
-    return take!(stream.data_buffer)
+    data = peek_data(stream)
+    take!(stream.data_buffer)
+    stream.data_offset = 1
+    return data
 end
 
 """
@@ -332,9 +340,11 @@ end
 Peek at accumulated data without consuming it.
 """
 function peek_data(stream::HTTP2Stream)::Vector{UInt8}
-    data = take!(stream.data_buffer)
-    write(stream.data_buffer, data)
-    return data
+    io = stream.data_buffer
+    if stream.data_offset > io.size
+        return UInt8[]
+    end
+    return Vector{UInt8}(view(io.data, stream.data_offset:io.size))
 end
 
 """

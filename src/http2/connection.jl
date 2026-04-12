@@ -65,7 +65,7 @@ mutable struct ConnectionSettings
     function ConnectionSettings()
         new(
             DEFAULT_HEADER_TABLE_SIZE,
-            true,
+            false,
             100,  # Default for servers
             DEFAULT_INITIAL_WINDOW_SIZE,
             DEFAULT_MAX_FRAME_SIZE,
@@ -144,7 +144,8 @@ Manages an HTTP/2 connection.
 - `streams::Dict{UInt32, HTTP2Stream}`: Active streams
 - `hpack_encoder::HPACKEncoder`: HPACK encoder
 - `hpack_decoder::HPACKDecoder`: HPACK decoder
-- `flow_controller::FlowController`: Flow control manager
+- `send_flow_controller::FlowController`: Outbound flow control manager
+- `recv_flow_controller::FlowController`: Inbound flow control manager
 - `next_stream_id::UInt32`: Next server-initiated stream ID
 - `last_client_stream_id::UInt32`: Highest client stream ID seen
 - `goaway_sent::Bool`: Whether GOAWAY has been sent
@@ -159,7 +160,8 @@ mutable struct HTTP2Connection
     streams::Dict{UInt32, HTTP2Stream}
     hpack_encoder::HPACKEncoder
     hpack_decoder::HPACKDecoder
-    flow_controller::FlowController
+    send_flow_controller::FlowController
+    recv_flow_controller::FlowController
     next_stream_id::UInt32
     last_client_stream_id::UInt32
     goaway_sent::Bool
@@ -175,6 +177,7 @@ mutable struct HTTP2Connection
             Dict{UInt32, HTTP2Stream}(),
             HPACKEncoder(local_settings.header_table_size),
             HPACKDecoder(local_settings.header_table_size),
+            FlowController(local_settings.initial_window_size),
             FlowController(local_settings.initial_window_size),
             2,  # Server-initiated streams are even
             0,
@@ -221,7 +224,8 @@ function create_stream(conn::HTTP2Connection, stream_id::UInt32)::HTTP2Stream
 
         stream = HTTP2Stream(stream_id, conn.local_settings.initial_window_size)
         conn.streams[stream_id] = stream
-        create_stream_window!(conn.flow_controller, stream_id)
+        create_stream_window!(conn.send_flow_controller, stream_id)
+        create_stream_window!(conn.recv_flow_controller, stream_id)
 
         return stream
     end
@@ -235,7 +239,8 @@ Remove a closed stream.
 function remove_stream(conn::HTTP2Connection, stream_id::UInt32)
     lock(conn.lock) do
         delete!(conn.streams, stream_id)
-        remove_stream_window!(conn.flow_controller, stream_id)
+        remove_stream_window!(conn.send_flow_controller, stream_id)
+        remove_stream_window!(conn.recv_flow_controller, stream_id)
     end
 end
 
@@ -318,7 +323,7 @@ function process_frame(conn::HTTP2Connection, frame::Frame)::Vector{Frame}
     end
 
     # Generate flow control updates if needed
-    append!(response_frames, generate_window_updates(conn.flow_controller))
+    append!(response_frames, generate_window_updates(conn.recv_flow_controller))
 
     return response_frames
 end
@@ -351,7 +356,10 @@ function process_settings_frame!(conn::HTTP2Connection, frame::Frame)::Vector{Fr
 
     # Adjust flow control windows if initial window size changed
     if conn.remote_settings.initial_window_size != old_initial_window_size
-        apply_settings_initial_window_size!(conn.flow_controller, conn.remote_settings.initial_window_size)
+        apply_settings_initial_window_size!(
+            conn.send_flow_controller,
+            conn.remote_settings.initial_window_size,
+        )
     end
 
     # Send ACK
@@ -422,7 +430,7 @@ function process_window_update_frame!(conn::HTTP2Connection, frame::Frame)
         end
     end
 
-    apply_window_update!(conn.flow_controller, frame.header.stream_id, Int(increment))
+    apply_window_update!(conn.send_flow_controller, frame.header.stream_id, Int(increment))
 end
 
 """
@@ -544,8 +552,10 @@ function process_data_frame!(conn::HTTP2Connection, frame::Frame)::Vector{Frame}
         throw(ConnectionError(ErrorCode.STREAM_CLOSED, "DATA for closed stream $stream_id"))
     end
 
+    receiver = DataReceiver(conn.recv_flow_controller, conn.local_settings.max_frame_size)
+    payload = receive_data!(receiver, stream_id, frame)
+
     # Handle padding
-    payload = frame.payload
     if has_flag(frame.header, FrameFlags.PADDED)
         if isempty(payload)
             throw(ConnectionError(ErrorCode.PROTOCOL_ERROR, "Empty padded DATA"))
@@ -640,14 +650,19 @@ Create DATA frames for response data.
 function send_data(conn::HTTP2Connection, stream_id::UInt32, data::Vector{UInt8};
                    end_stream::Bool=false)::Vector{Frame}
     max_frame_size = conn.remote_settings.max_frame_size
-    sender = DataSender(conn.flow_controller, max_frame_size)
+    sender = DataSender(conn.send_flow_controller, max_frame_size)
     frames = send_data_frames(sender, stream_id, data; end_stream=end_stream)
 
     # Update stream state for each frame
     stream = get_stream(conn, stream_id)
     if stream !== nothing
         for frame in frames
-            send_data!(stream, Int(frame.header.length), has_flag(frame.header, FrameFlags.END_STREAM))
+            send_data!(
+                stream,
+                Int(frame.header.length),
+                has_flag(frame.header, FrameFlags.END_STREAM);
+                update_flow_control=false,
+            )
         end
     end
 

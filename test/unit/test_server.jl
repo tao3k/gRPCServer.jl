@@ -166,4 +166,72 @@ using gRPCServer
         @test gRPCServer.get_stream(conn, UInt32(3)) === nothing
         @test !isempty(take!(io))
     end
+
+    @testset "Unary streams are not redispatched on trailing empty END_STREAM" begin
+        server = GRPCServer("0.0.0.0", 50051)
+        calls = Ref(0)
+
+        descriptor = ServiceDescriptor(
+            "test.DispatchOnce",
+            Dict(
+                "Check" => MethodDescriptor(
+                    "Check",
+                    MethodType.UNARY,
+                    gRPCServer.HealthCheckRequest,
+                    gRPCServer.HealthCheckResponse,
+                    (ctx, req) -> begin
+                        calls[] += 1
+                        return gRPCServer.HealthCheckResponse(
+                            gRPCServer.var"HealthCheckResponse.ServingStatus".SERVING,
+                        )
+                    end,
+                ),
+            ),
+            nothing,
+        )
+        gRPCServer.register_service!(server.dispatcher, descriptor)
+        server.health_status[descriptor.name] = HealthStatus.SERVING
+
+        conn = gRPCServer.HTTP2Connection()
+        conn.state = gRPCServer.ConnectionState.OPEN
+        peer = gRPCServer.PeerInfo(ip"127.0.0.1", 50051)
+
+        stream = gRPCServer.create_stream(conn, UInt32(1))
+        stream.request_headers = [
+            (":path", "/test.DispatchOnce/Check"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ]
+        stream.headers_complete = true
+        gRPCServer.receive_headers!(stream, false)
+
+        request_bytes = gRPCServer.encode_grpc_message(
+            gRPCServer.serialize_message(gRPCServer.HealthCheckRequest(""));
+            compressed=false,
+        )
+
+        io = IOBuffer()
+        gRPCServer.process_incoming_frame!(
+            server,
+            conn,
+            io,
+            peer,
+            gRPCServer.data_frame(1, request_bytes; end_stream=false),
+        )
+
+        @test calls[] == 1
+        @test gRPCServer.get_stream(conn, UInt32(1)) === stream
+        @test stream.request_dispatched
+
+        gRPCServer.process_incoming_frame!(
+            server,
+            conn,
+            io,
+            peer,
+            gRPCServer.data_frame(1, UInt8[]; end_stream=true),
+        )
+
+        @test calls[] == 1
+        @test gRPCServer.get_stream(conn, UInt32(1)) === nothing
+    end
 end

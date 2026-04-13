@@ -956,6 +956,16 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
     end
 
     service, method_desc = result
+    incremental_bidi = method_desc.method_type == MethodType.BIDI_STREAMING &&
+                       service.name in (
+        "grpc.reflection.v1alpha.ServerReflection",
+        "arrow.flight.protocol.FlightService",
+    )
+
+    if stream.request_dispatched && !incremental_bidi
+        @debug "Skipping already-dispatched stream" stream_id=stream.id method=method_path
+        return
+    end
 
     # For client streaming, we must wait for END_STREAM before processing
     # because all client messages need to be collected first.
@@ -985,6 +995,8 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
             return  # Don't process yet, wait for END_STREAM
         end
     end
+
+    stream.request_dispatched = true
 
     # Read one gRPC message (for unary/server-streaming this is the request,
     # for client-streaming this is the first of many messages already in buffer)

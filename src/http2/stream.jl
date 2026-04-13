@@ -68,6 +68,7 @@ Represents an HTTP/2 stream with state machine and data buffers.
 - `end_stream_received::Bool`: Whether END_STREAM has been received
 - `end_stream_sent::Bool`: Whether END_STREAM has been sent
 - `reset::Bool`: Whether stream has been reset
+- `request_dispatched::Bool`: Whether a one-shot RPC request has already been dispatched
 """
 mutable struct HTTP2Stream
     id::UInt32
@@ -83,6 +84,7 @@ mutable struct HTTP2Stream
     end_stream_received::Bool
     end_stream_sent::Bool
     reset::Bool
+    request_dispatched::Bool
     headers_sent::Bool  # Track if response headers have been sent (for incremental streaming)
 
     function HTTP2Stream(id::Integer, initial_window_size::Int=DEFAULT_INITIAL_WINDOW_SIZE)
@@ -96,6 +98,7 @@ mutable struct HTTP2Stream
             Tuple{String, String}[],
             IOBuffer(),
             1,
+            false,
             false,
             false,
             false,

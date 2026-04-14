@@ -81,7 +81,11 @@ function _type_to_proto_name(T::Type)::String
     parts = String[]
     while mod !== Main && mod !== Base && mod !== Core
         pushfirst!(parts, string(nameof(mod)))
-        mod = parentmodule(mod)
+        next_mod = parentmodule(mod)
+        # Top-level modules can report themselves as their own parent.
+        # Stop there so typed MethodDescriptor construction does not loop.
+        next_mod === mod && break
+        mod = next_mod
     end
 
     if isempty(parts)

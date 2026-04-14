@@ -1135,6 +1135,27 @@ function handle_server_streaming(
 end
 
 """
+    is_request_stream_cancelled(ctx::ServerContext, stream::HTTP2Stream) -> Bool
+
+Return whether request processing should treat the stream as cancelled.
+
+An orderly remote `END_STREAM` may leave the HTTP/2 stream in `CLOSED` after
+all request data has already arrived. That state should terminate iteration
+cleanly rather than being reported as cancellation to application handlers.
+"""
+function is_request_stream_cancelled(ctx::ServerContext, stream::HTTP2Stream)::Bool
+    if ctx.cancelled || stream.reset
+        return true
+    end
+
+    if stream.state != StreamState.CLOSED
+        return false
+    end
+
+    return !stream.end_stream_received
+end
+
+"""
     wait_for_message_or_end(server::GRPCServer, stream::HTTP2Stream, conn::HTTP2Connection, io::IO, peer::PeerInfo) -> Bool
 
 Wait for either a complete gRPC message or end of stream.
@@ -1168,14 +1189,12 @@ function wait_for_message_or_end(
             return false
         end
 
-        # Process any pending frames from the connection
-        # This reads more data if available
+        # Read and process the next frame from the connection. Live Flight
+        # bidi handlers can otherwise miss a trailing empty END_STREAM frame
+        # that is still sitting in the socket buffer but not yet visible via
+        # `bytesavailable(io)`.
         try
-            if eof(io)
-                return false
-            end
-            # Try to read and process any waiting frames
-            frame = try_read_frame(io, conn)
+            frame = read_frame(io)
             if frame !== nothing
                 process_incoming_frame!(
                     server,
@@ -1199,27 +1218,6 @@ function wait_for_message_or_end(
 
     @warn "Exceeded max iterations waiting for message" stream_id=stream.id
     return false
-end
-
-"""
-    try_read_frame(io::IO, conn::HTTP2Connection) -> Union{Frame, Nothing}
-
-Try to read a frame without blocking. Returns nothing if no complete frame available.
-"""
-function try_read_frame(io::IO, conn::HTTP2Connection)::Union{Frame, Nothing}
-    # Check if there's enough data for a frame header (9 bytes)
-    if bytesavailable(io) < 9
-        return nothing
-    end
-
-    try
-        return read_frame(io)
-    catch e
-        if e isa EOFError
-            return nothing
-        end
-        rethrow()
-    end
 end
 
 """
@@ -1300,7 +1298,7 @@ function handle_bidi_streaming_live(
         end
 
         is_cancelled_callback = function()
-            return ctx.cancelled || stream.state == StreamState.CLOSED
+            return is_request_stream_cancelled(ctx, stream)
         end
 
         status, message = dispatch_bidi_streaming(
@@ -1411,7 +1409,7 @@ function handle_client_streaming(
 
         # Create is_cancelled callback
         is_cancelled_callback = function()
-            return ctx.cancelled || stream.state == StreamState.CLOSED
+            return is_request_stream_cancelled(ctx, stream)
         end
 
         # Call dispatcher which handles the handler execution
@@ -1616,7 +1614,7 @@ function handle_bidi_streaming(
 
         # Create is_cancelled callback
         is_cancelled_callback = function()
-            return ctx.cancelled || stream.state == StreamState.CLOSED
+            return is_request_stream_cancelled(ctx, stream)
         end
 
         # Call dispatcher which handles the handler execution

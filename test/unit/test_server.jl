@@ -113,6 +113,24 @@ using gRPCServer
         @test length(server.dispatcher.interceptor_chain) == 1
     end
 
+    @testset "Typed MethodDescriptor resolves top-level module types" begin
+        handler = (ctx, req) -> gRPCServer.HealthCheckResponse(
+            gRPCServer.var"HealthCheckResponse.ServingStatus".SERVING,
+        )
+        method = MethodDescriptor(
+            "Check",
+            MethodType.UNARY,
+            gRPCServer.HealthCheckRequest,
+            gRPCServer.HealthCheckResponse,
+            handler,
+        )
+
+        @test method.input_type == "gRPCServer.HealthCheckRequest"
+        @test method.output_type == "gRPCServer.HealthCheckResponse"
+        @test method.input_julia_type === gRPCServer.HealthCheckRequest
+        @test method.output_julia_type === gRPCServer.HealthCheckResponse
+    end
+
     @testset "Live bidi frame pump dispatches sibling streams without consuming active stream" begin
         server = GRPCServer("0.0.0.0", 50051; enable_health_check=true)
         gRPCServer.register_builtin_services!(server)
@@ -233,5 +251,51 @@ using gRPCServer
 
         @test calls[] == 1
         @test gRPCServer.get_stream(conn, UInt32(1)) === nothing
+    end
+
+    @testset "Orderly remote END_STREAM is not treated as cancellation" begin
+        ctx = ServerContext()
+        stream = gRPCServer.HTTP2Stream(UInt32(1))
+
+        stream.state = gRPCServer.StreamState.CLOSED
+        stream.end_stream_received = true
+        @test !gRPCServer.is_request_stream_cancelled(ctx, stream)
+
+        stream.end_stream_received = false
+        @test gRPCServer.is_request_stream_cancelled(ctx, stream)
+
+        stream.end_stream_received = true
+        ctx.cancelled = true
+        @test gRPCServer.is_request_stream_cancelled(ctx, stream)
+
+        ctx.cancelled = false
+        stream.reset = true
+        @test gRPCServer.is_request_stream_cancelled(ctx, stream)
+    end
+
+    @testset "Live waiter consumes trailing empty END_STREAM frames" begin
+        server = GRPCServer("0.0.0.0", 50051)
+        conn = gRPCServer.HTTP2Connection()
+        conn.state = gRPCServer.ConnectionState.OPEN
+        peer = gRPCServer.PeerInfo(ip"127.0.0.1", 50051)
+
+        stream = gRPCServer.create_stream(conn, UInt32(1))
+        stream.request_headers = [
+            (":path", "/arrow.flight.protocol.FlightService/Handshake"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ]
+        stream.headers_complete = true
+        gRPCServer.receive_headers!(stream, false)
+
+        io = Base.BufferStream()
+        waiter = @async gRPCServer.wait_for_message_or_end(server, stream, conn, io, peer)
+
+        sleep(0.05)
+        write(io, gRPCServer.encode_frame(gRPCServer.data_frame(1, UInt8[]; end_stream=true)))
+
+        @test fetch(waiter) == false
+        @test stream.end_stream_received
+        @test stream.state == gRPCServer.StreamState.HALF_CLOSED_REMOTE
     end
 end

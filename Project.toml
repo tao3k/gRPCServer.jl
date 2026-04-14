@@ -8,9 +8,9 @@ Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
-OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
+Reseau = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
@@ -18,10 +18,11 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 [compat]
 CodecZlib = "0.7"
 Coverage = "1.8"
-OpenSSL = "1"
 PrecompileTools = "1"
 ProtoBuf = "1.2"
-TranscodingStreams = "0.9"
+Reseau = "1"
+TranscodingStreams = "0.9, 0.10, 0.11"
+gRPCClient = "1"
 julia = "1.10"
 
 [extras]
@@ -29,6 +30,7 @@ Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 Coverage = "a2441757-f6aa-5fb2-8edb-039e3f45d037"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 
 [targets]
-test = ["Aqua", "Coverage", "JSON3", "Test"]
+test = ["Aqua", "Coverage", "JSON3", "Test", "gRPCClient"]

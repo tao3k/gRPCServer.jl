@@ -829,7 +829,6 @@ Encode a list of headers into an HPACK header block.
 function encode_headers(encoder::HPACKEncoder, headers::Vector{Tuple{String, String}})::Vector{UInt8}
     result = UInt8[]
     for (name, value) in headers
-        # Use :never indexing for sensitive headers
         indexing = if name in ("authorization", "cookie", "set-cookie")
             :never
         else

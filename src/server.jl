@@ -56,6 +56,9 @@ mutable struct GRPCServer
     accept_task::Union{Task, Nothing}
     connection_tasks::Vector{Task}
     lock::ReentrantLock
+    request_admission::Base.GenericCondition{ReentrantLock}
+    active_requests::Int
+    queued_requests::Int
     shutdown_event::Condition
     last_error::Union{Exception, Nothing}
 
@@ -129,6 +132,9 @@ mutable struct GRPCServer
             nothing,
             Task[],
             ReentrantLock(),
+            Base.GenericCondition{ReentrantLock}(ReentrantLock()),
+            0,
+            0,
             Condition(),
             nothing,
             nothing,  # tls_transport - initialized in start!() when TLS configured
@@ -249,6 +255,81 @@ end
 function _clear_accept_task!(server::GRPCServer, task::Task=current_task())
     lock(server.lock) do
         server.accept_task === task && (server.accept_task = nothing)
+    end
+    return nothing
+end
+
+function _try_register_connection!(server::GRPCServer, client)::Bool
+    lock(server.lock) do
+        limit = server.config.max_connections
+        if !isnothing(limit) && length(server.connections) >= limit
+            return false
+        end
+        push!(server.connections, client)
+        return true
+    end
+end
+
+function _unregister_connection!(server::GRPCServer, client)
+    lock(server.lock) do
+        filter!(c -> c !== client, server.connections)
+    end
+    return nothing
+end
+
+function _request_admission_state(server::GRPCServer)
+    lock(server.request_admission) do
+        return (
+            active_requests=server.active_requests,
+            queued_requests=server.queued_requests,
+        )
+    end
+end
+
+function _notify_request_admission_waiters!(server::GRPCServer)
+    lock(server.request_admission) do
+        notify(server.request_admission; all=true)
+    end
+    return nothing
+end
+
+function _acquire_request_slot!(server::GRPCServer)::Symbol
+    limit = server.config.max_concurrent_requests
+    if isnothing(limit)
+        lock(server.request_admission) do
+            server.active_requests += 1
+        end
+        return :acquired
+    end
+
+    lock(server.request_admission)
+    try
+        while true
+            if server.status != ServerStatus.RUNNING
+                return :server_stopping
+            elseif server.active_requests < limit
+                server.active_requests += 1
+                return :acquired
+            elseif server.queued_requests >= server.config.max_queued_requests
+                return :queue_full
+            end
+
+            server.queued_requests += 1
+            try
+                wait(server.request_admission)
+            finally
+                server.queued_requests -= 1
+            end
+        end
+    finally
+        unlock(server.request_admission)
+    end
+end
+
+function _release_request_slot!(server::GRPCServer)
+    lock(server.request_admission) do
+        server.active_requests > 0 && (server.active_requests -= 1)
+        notify(server.request_admission; all=true)
     end
     return nothing
 end
@@ -440,6 +521,7 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
     if force
         # Immediate shutdown
         server.status = ServerStatus.STOPPING
+        _notify_request_admission_waiters!(server)
         _close_listener!(server)
         close_all_connections(server)
         _wait_for_server_tasks!(server, timeout > 0 ? timeout : 5.0)
@@ -447,6 +529,7 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
     else
         # Graceful shutdown
         server.status = ServerStatus.DRAINING
+        _notify_request_admission_waiters!(server)
 
         # Stop accepting new connections
         _close_listener!(server)
@@ -461,6 +544,7 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
 
         # Force close remaining connections
         server.status = ServerStatus.STOPPING
+        _notify_request_admission_waiters!(server)
         close_all_connections(server)
         _wait_for_server_tasks!(server, max(drain_deadline - time(), 0.0))
         server.status = ServerStatus.STOPPED
@@ -627,8 +711,13 @@ function _tls_accept_loop(server::GRPCServer)
 end
 
 function handle_connection(server::GRPCServer, client)
-    lock(server.lock) do
-        push!(server.connections, client)
+    if !_try_register_connection!(server, client)
+        @warn "Rejecting connection at configured capacity" max_connections=server.config.max_connections
+        try
+            close(client)
+        catch
+        end
+        return
     end
 
     try
@@ -718,10 +807,7 @@ function handle_connection(server::GRPCServer, client)
         catch
         end
         _forget_connection_task!(server, current_task())
-
-        lock(server.lock) do
-            filter!(c -> c !== client, server.connections)
-        end
+        _unregister_connection!(server, client)
     end
 end
 
@@ -1096,6 +1182,22 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             continue
         end
 
+        admission = _acquire_request_slot!(server)
+        if admission == :queue_full
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.RESOURCE_EXHAUSTED,
+                "Server request queue exhausted";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
+        elseif admission != :acquired
+            return
+        end
+
         try
             process_stream_request!(server, conn, stream, io, peer)
 
@@ -1115,6 +1217,8 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             end
             # Always remove stream on error
             remove_stream(conn, stream_id)
+        finally
+            _release_request_slot!(server)
         end
     end
 end

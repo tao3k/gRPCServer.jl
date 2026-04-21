@@ -312,6 +312,75 @@ using .ConformanceData
             @test conn.local_settings.max_concurrent_streams == 100
         end
 
+        @testset "Configured connection admission rejects excess registrations" begin
+            server = GRPCServer("127.0.0.1", 50051; max_connections=1)
+
+            client1 = IOBuffer()
+            client2 = IOBuffer()
+
+            @test gRPCServer._try_register_connection!(server, client1)
+            @test !gRPCServer._try_register_connection!(server, client2)
+            @test length(server.connections) == 1
+
+            gRPCServer._unregister_connection!(server, client1)
+            @test isempty(server.connections)
+        end
+
+        @testset "Configured request admission queues and wakes waiters" begin
+            server = GRPCServer(
+                "127.0.0.1",
+                50051;
+                max_concurrent_requests=1,
+                max_queued_requests=1,
+            )
+            server.status = ServerStatus.RUNNING
+
+            @test gRPCServer._acquire_request_slot!(server) == :acquired
+
+            waiter = @async gRPCServer._acquire_request_slot!(server)
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(server).queued_requests == 1,
+                1.0,
+            ) === :ok
+
+            @test gRPCServer._acquire_request_slot!(server) == :queue_full
+
+            gRPCServer._release_request_slot!(server)
+            @test fetch(waiter) == :acquired
+
+            state = gRPCServer._request_admission_state(server)
+            @test state.active_requests == 1
+            @test state.queued_requests == 0
+
+            gRPCServer._release_request_slot!(server)
+            @test gRPCServer._request_admission_state(server).active_requests == 0
+        end
+
+        @testset "Queued request admission exits on shutdown notification" begin
+            server = GRPCServer(
+                "127.0.0.1",
+                50051;
+                max_concurrent_requests=1,
+                max_queued_requests=1,
+            )
+            server.status = ServerStatus.RUNNING
+
+            @test gRPCServer._acquire_request_slot!(server) == :acquired
+
+            waiter = @async gRPCServer._acquire_request_slot!(server)
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(server).queued_requests == 1,
+                1.0,
+            ) === :ok
+
+            server.status = ServerStatus.STOPPING
+            gRPCServer._notify_request_admission_waiters!(server)
+            @test fetch(waiter) == :server_stopping
+
+            gRPCServer._release_request_slot!(server)
+            @test gRPCServer._request_admission_state(server).active_requests == 0
+        end
+
     end  # T041
 
 end  # AC6: Connection Management

@@ -26,6 +26,13 @@ Full documentation is available at [s-celles.github.io/gRPCServer.jl](https://s-
 - Julia 1.10 or later
 - ProtoBuf.jl for message serialization
 
+## Operational Limits
+
+`ServerConfig.max_connections`, `max_concurrent_requests`, and
+`max_queued_requests` are enforced by the runtime. Excess accepted connections
+are closed at the server boundary, and requests beyond the active plus queued
+budget are rejected with `RESOURCE_EXHAUSTED`.
+
 ## Related Packages
 
 - [gRPCClient.jl](https://github.com/JuliaIO/gRPCClient.jl) - gRPC client for Julia

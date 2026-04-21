@@ -381,6 +381,56 @@ end
         end
     end
 
+    @testset "Blocking run stays blocked across restart cycles" begin
+        server = GRPCServer("127.0.0.1", test_available_port())
+        runner1 = nothing
+        runner2 = nothing
+        try
+            runner1 = @async run(server)
+            @test timedwait(() -> server.status == ServerStatus.RUNNING, 2.0) === :ok
+
+            stop!(server; force=true, timeout=2.0)
+            @test timedwait(() -> istaskdone(runner1), 1.0) === :ok
+            wait(runner1)
+            runner1 = nothing
+
+            runner2 = @async run(server)
+            @test timedwait(() -> server.status == ServerStatus.RUNNING, 2.0) === :ok
+            @test timedwait(() -> istaskdone(runner2), 0.2) === :timed_out
+
+            stop!(server; force=true, timeout=2.0)
+            @test timedwait(() -> istaskdone(runner2), 1.0) === :ok
+            wait(runner2)
+            runner2 = nothing
+
+            @test server.status == ServerStatus.STOPPED
+        finally
+            for runner in (runner1, runner2)
+                if runner !== nothing && !istaskdone(runner)
+                    try
+                        stop!(server; force=true, timeout=2.0)
+                    catch
+                    end
+                    try
+                        wait(runner)
+                    catch
+                    end
+                elseif runner !== nothing
+                    try
+                        wait(runner)
+                    catch
+                    end
+                end
+            end
+            if server.status != ServerStatus.STOPPED
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+            end
+        end
+    end
+
     @testset "Idle timeout closes connections before preface" begin
         server = GRPCServer("127.0.0.1", test_available_port(); idle_timeout=0.2)
         client = nothing

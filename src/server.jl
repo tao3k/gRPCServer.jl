@@ -59,7 +59,7 @@ mutable struct GRPCServer
     request_admission::Base.GenericCondition{ReentrantLock}
     active_requests::Int
     queued_requests::Int
-    shutdown_event::Condition
+    shutdown_event::Base.Event
     last_error::Union{Exception, Nothing}
 
     # TLS state
@@ -135,7 +135,7 @@ mutable struct GRPCServer
             Base.GenericCondition{ReentrantLock}(ReentrantLock()),
             0,
             0,
-            Condition(),
+            Base.Event(),
             nothing,
             nothing,  # tls_transport - initialized in start!() when TLS configured
             http2_backend
@@ -447,6 +447,7 @@ function start!(server::GRPCServer)
         throw(InvalidServerStateError(:STOPPED, Symbol(server.status)))
     end
 
+    reset(server.shutdown_event)
     server.status = ServerStatus.STARTING
     server.last_error = nothing
 
@@ -600,9 +601,7 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
     end
 
     @info "gRPC server stopped"
-    lock(server.lock) do
-        notify(server.shutdown_event)
-    end
+    notify(server.shutdown_event)
 end
 
 """
@@ -629,8 +628,6 @@ function Base.run(server::GRPCServer; block::Bool=true)
     start!(server)
 
     if block
-        # Wait for shutdown without holding the lock
-        # The shutdown_event is a simple Condition that doesn't require a lock
         try
             while server.status != ServerStatus.STOPPED
                 wait(server.shutdown_event)

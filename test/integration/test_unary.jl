@@ -97,6 +97,18 @@ function ack_server_ping!(session::LiveHTTP2UnarySession, ping::PureHTTP2.Frame)
     return nothing
 end
 
+function ack_keepalive_rounds!(
+    session::LiveHTTP2UnarySession;
+    rounds::Int,
+    timeout::Float64=1.0,
+)
+    for _ in 1:rounds
+        ping = await_server_ping!(session; timeout=timeout)
+        ack_server_ping!(session, ping)
+    end
+    return rounds
+end
+
 function send_live_unary_request!(
     session::LiveHTTP2UnarySession,
     path::String,
@@ -528,6 +540,46 @@ end
             finally
                 close_live_http2_unary_session!(session)
                 @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+            end
+        end
+    end
+
+    @testset "Concurrent Keepalive ACK Soak Keeps Idle Sessions Stable And Stops Cleanly" begin
+        with_test_server(keepalive_interval=0.1, keepalive_timeout=0.2) do ts
+            session_count = 6
+            rounds = 3
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            stopper = nothing
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                soak_tasks = [
+                    @async ack_keepalive_rounds!(session; rounds=rounds, timeout=1.0) for
+                    session in sessions
+                ]
+                @test fetch.(soak_tasks) == fill(rounds, session_count)
+                @test length(ts.server.connections) == session_count
+                @test isempty(ts.server.connection_tasks) == false
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+                @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test isempty(ts.server.connections)
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.0) === :ok
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+                @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                if stopper !== nothing && !istaskdone(stopper)
+                    wait(stopper)
+                end
             end
         end
     end

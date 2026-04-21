@@ -31,7 +31,8 @@ Full documentation is available at [s-celles.github.io/gRPCServer.jl](https://s-
 `ServerConfig.max_connections`, `max_concurrent_requests`, and
 `max_queued_requests` are enforced by the runtime. Excess accepted connections
 are closed at the server boundary, and requests beyond the active plus queued
-budget are rejected with `RESOURCE_EXHAUSTED`.
+budget are rejected with `RESOURCE_EXHAUSTED`. Queued requests also honor the
+incoming `grpc-timeout` deadline while waiting for server capacity.
 
 ## Related Packages
 

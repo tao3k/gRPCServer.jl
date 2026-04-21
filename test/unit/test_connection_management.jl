@@ -2,6 +2,7 @@
 # Tests per RFC 7540 and gRPC HTTP/2 Protocol Specification
 
 using Test
+using Dates
 using gRPCServer
 using PureHTTP2
 
@@ -376,6 +377,34 @@ using .ConformanceData
             server.status = ServerStatus.STOPPING
             gRPCServer._notify_request_admission_waiters!(server)
             @test fetch(waiter) == :server_stopping
+
+            gRPCServer._release_request_slot!(server)
+            @test gRPCServer._request_admission_state(server).active_requests == 0
+        end
+
+        @testset "Queued request admission respects deadline" begin
+            server = GRPCServer(
+                "127.0.0.1",
+                50051;
+                max_concurrent_requests=1,
+                max_queued_requests=1,
+            )
+            server.status = ServerStatus.RUNNING
+
+            @test gRPCServer._acquire_request_slot!(server) == :acquired
+
+            deadline = now() + Millisecond(500)
+            waiter = @async gRPCServer._acquire_request_slot!(server; deadline=deadline)
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(server).queued_requests == 1,
+                1.0,
+                pollint=0.01,
+            ) === :ok
+            @test fetch(waiter) == :deadline_exceeded
+
+            state = gRPCServer._request_admission_state(server)
+            @test state.active_requests == 1
+            @test state.queued_requests == 0
 
             gRPCServer._release_request_slot!(server)
             @test gRPCServer._request_admission_state(server).active_requests == 0

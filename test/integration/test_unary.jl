@@ -9,21 +9,26 @@ using Sockets
 # TestUtils is included once in runtests.jl to avoid method redefinition warnings
 # using TestUtils is inherited from the parent module
 
-function run_live_unary_request(port::Int, path::String, payload::Vector{UInt8})
+function run_live_unary_request(
+    port::Int,
+    path::String,
+    payload::Vector{UInt8};
+    extra_headers::Vector{Tuple{String,String}}=Tuple{String,String}[],
+)
     tcp = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
     conn = PureHTTP2.HTTP2Connection()
     try
         result = PureHTTP2.open_connection!(
             conn,
             tcp;
-            request_headers=[
+            request_headers=vcat([
                 (":method", "POST"),
                 (":path", path),
                 (":scheme", "http"),
                 (":authority", "127.0.0.1:$port"),
                 ("content-type", "application/grpc"),
                 ("te", "trailers"),
-            ],
+            ], extra_headers),
             request_body=build_grpc_message(payload),
         )
 
@@ -341,6 +346,57 @@ end
 
             disconnect!(blocker)
             @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+        end
+    end
+
+    @testset "Live Unary Admission Deadline While Queued" begin
+        descriptor = ServiceDescriptor(
+            "test.DeadlineQueueService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=1, max_queued_requests=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.DeadlineQueueService"] = HealthStatus.SERVING
+
+            request_path = "/test.DeadlineQueueService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x09, 0x0A])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            started_at = time()
+            second_result = run_live_unary_request(
+                ts.port,
+                request_path,
+                UInt8[0x0B, 0x0C];
+                extra_headers=[("grpc-timeout", "100m")],
+            )
+            elapsed = time() - started_at
+
+            @test second_result.collector.grpc_status == Int(StatusCode.DEADLINE_EXCEEDED)
+            @test second_result.collector.grpc_message !== nothing
+            @test occursin("deadline", lowercase(second_result.collector.grpc_message))
+            @test elapsed < 0.25
+
+            first_result = fetch(first)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
         end
     end
 end

@@ -293,7 +293,10 @@ function _notify_request_admission_waiters!(server::GRPCServer)
     return nothing
 end
 
-function _acquire_request_slot!(server::GRPCServer)::Symbol
+function _acquire_request_slot!(
+    server::GRPCServer;
+    deadline::Union{Nothing,DateTime}=nothing,
+)::Symbol
     limit = server.config.max_concurrent_requests
     if isnothing(limit)
         lock(server.request_admission) do
@@ -307,6 +310,8 @@ function _acquire_request_slot!(server::GRPCServer)::Symbol
         while true
             if server.status != ServerStatus.RUNNING
                 return :server_stopping
+            elseif !isnothing(deadline) && deadline <= now()
+                return :deadline_exceeded
             elseif server.active_requests < limit
                 server.active_requests += 1
                 return :acquired
@@ -315,9 +320,25 @@ function _acquire_request_slot!(server::GRPCServer)::Symbol
             end
 
             server.queued_requests += 1
+            timer = nothing
             try
+                if !isnothing(deadline)
+                    remaining = Dates.value(deadline - now()) / 1000.0
+                    if remaining <= 0
+                        return :deadline_exceeded
+                    end
+                    timer = Timer(_ -> begin
+                        lock(server.request_admission)
+                        try
+                            notify(server.request_admission; all=true)
+                        finally
+                            unlock(server.request_admission)
+                        end
+                    end, remaining)
+                end
                 wait(server.request_admission)
             finally
+                timer !== nothing && close(timer)
                 server.queued_requests -= 1
             end
         end
@@ -1182,7 +1203,10 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             continue
         end
 
-        admission = _acquire_request_slot!(server)
+        timeout_header = get_grpc_timeout(stream)
+        deadline = timeout_header === nothing ? nothing : parse_grpc_timeout(timeout_header)
+
+        admission = _acquire_request_slot!(server; deadline=deadline)
         if admission == :queue_full
             send_error_response(
                 conn,
@@ -1190,6 +1214,17 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
                 stream_id,
                 StatusCode.RESOURCE_EXHAUSTED,
                 "Server request queue exhausted";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
+        elseif admission == :deadline_exceeded
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.DEADLINE_EXCEEDED,
+                "Request deadline exceeded while waiting for server capacity";
                 content_type=get_response_content_type(stream),
             )
             remove_stream(conn, stream_id)

@@ -299,4 +299,48 @@ end
             @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
         end
     end
+
+    @testset "Live Connection Admission Saturation" begin
+        descriptor = ServiceDescriptor(
+            "test.ConnectionLimitService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> req,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_connections=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.ConnectionLimitService"] = HealthStatus.SERVING
+
+            blocker = MockGRPCClient("127.0.0.1", ts.port)
+            @test connect!(blocker)
+            @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+            saturation_error = try
+                run_live_unary_request(
+                    ts.port,
+                    "/test.ConnectionLimitService/Echo",
+                    UInt8[0x07, 0x08],
+                )
+                nothing
+            catch err
+                err
+            end
+
+            @test saturation_error !== nothing
+            @test saturation_error isa Exception
+            @test length(ts.server.connections) == 1
+            @test is_connected(blocker)
+
+            disconnect!(blocker)
+            @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+        end
+    end
 end

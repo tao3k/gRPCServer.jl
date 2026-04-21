@@ -601,4 +601,67 @@ end
             end
         end
     end
+
+    @testset "Live Unary Concurrent Soak Keeps Admission State Clean" begin
+        descriptor = ServiceDescriptor(
+            "test.ConcurrentUnarySoakService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.05)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=8, max_queued_requests=32) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.ConcurrentUnarySoakService"] = HealthStatus.SERVING
+
+            request_path = "/test.ConcurrentUnarySoakService/Echo"
+
+            for round in 1:3
+                payloads = [
+                    UInt8[UInt8(round), UInt8(i % 0xff), UInt8((i * 7) % 0xff)] for i in 1:24
+                ]
+                tasks = [
+                    @async run_live_unary_request(ts.port, request_path, payload) for
+                    payload in payloads
+                ]
+
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).active_requests >= 4,
+                    1.0,
+                ) === :ok
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).queued_requests >= 1,
+                    1.0,
+                ) === :ok
+
+                results = fetch.(tasks)
+                @test length(results) == length(payloads)
+                @test all(
+                    result.collector.grpc_status == Int(StatusCode.OK) for result in results
+                )
+                @test all(
+                    result.collector.data == build_grpc_message(payloads[i]) for
+                    (i, result) in pairs(results)
+                )
+
+                @test timedwait(
+                    () -> begin
+                        state = gRPCServer._request_admission_state(ts.server)
+                        state.active_requests == 0 && state.queued_requests == 0
+                    end,
+                    1.0,
+                ) === :ok
+            end
+        end
+    end
 end

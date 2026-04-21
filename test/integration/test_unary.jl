@@ -41,6 +41,96 @@ function run_live_unary_request(
     end
 end
 
+mutable struct LiveHTTP2UnarySession
+    port::Int
+    tcp::Sockets.TCPSocket
+    conn::PureHTTP2.HTTP2Connection
+    pending::Dict{UInt32, PureHTTP2.ClientStreamState}
+end
+
+function open_live_http2_unary_session(port::Int)
+    tcp = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
+    conn = PureHTTP2.HTTP2Connection()
+    conn.state = PureHTTP2.ConnectionState.OPEN
+    conn.next_stream_id = UInt32(1)
+    conn.pending_settings_ack = true
+    PureHTTP2._write_preface_and_settings!(conn, tcp)
+    return LiveHTTP2UnarySession(
+        port,
+        tcp,
+        conn,
+        Dict{UInt32, PureHTTP2.ClientStreamState}(),
+    )
+end
+
+function close_live_http2_unary_session!(session::LiveHTTP2UnarySession)
+    close(session.tcp)
+    return nothing
+end
+
+function send_live_unary_request!(
+    session::LiveHTTP2UnarySession,
+    path::String,
+    payload::Vector{UInt8};
+    extra_headers::Vector{Tuple{String,String}}=Tuple{String,String}[],
+)
+    stream_id = PureHTTP2._write_request!(
+        session.conn,
+        session.tcp,
+        vcat([
+            (":method", "POST"),
+            (":path", path),
+            (":scheme", "http"),
+            (":authority", "127.0.0.1:$(session.port)"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ], extra_headers),
+        build_grpc_message(payload),
+    )
+    session.pending[stream_id] = PureHTTP2.ClientStreamState(stream_id)
+    return stream_id
+end
+
+function await_live_unary_response!(
+    session::LiveHTTP2UnarySession,
+    stream_id::UInt32;
+    max_frame_size::Int=PureHTTP2.DEFAULT_MAX_FRAME_SIZE,
+)
+    while !PureHTTP2.is_closed(session.conn)
+        state = session.pending[stream_id]
+        if state.headers_complete && state.end_stream_received
+            break
+        end
+
+        frame = PureHTTP2._read_one_frame(session.tcp, max_frame_size)
+        if frame === nothing
+            if state.headers_complete && state.end_stream_received
+                break
+            end
+            error("Transport EOF before response complete for stream $stream_id")
+        end
+
+        exit_loop = PureHTTP2.client_dispatch_frame!(
+            session.conn,
+            session.tcp,
+            session.pending,
+            frame,
+        )
+        if exit_loop
+            updated_state = session.pending[stream_id]
+            if !(updated_state.headers_complete && updated_state.end_stream_received)
+                error("GOAWAY before response complete for stream $stream_id")
+            end
+        end
+    end
+
+    final_state = pop!(session.pending, stream_id)
+    collector = TestUtils.MockResponseCollector()
+    TestUtils.parse_response_headers!(collector, final_state.response_headers)
+    collector.data = take!(final_state.response_body)
+    return (; collector, headers=final_state.response_headers, body=collector.data)
+end
+
 @testset "Unary RPC Integration Tests" begin
     @testset "Basic Connection" begin
         with_test_server() do ts
@@ -448,6 +538,67 @@ end
             wait(stopper)
             @test ts.server.status == ServerStatus.STOPPED
             @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+        end
+    end
+
+    @testset "Graceful Stop Rejects New Stream On Existing Connection" begin
+        descriptor = ServiceDescriptor(
+            "test.GracefulDrainReuseService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        req == UInt8[0x11, 0x12] && sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server() do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.GracefulDrainReuseService"] = HealthStatus.SERVING
+
+            request_path = "/test.GracefulDrainReuseService/Echo"
+            session = open_live_http2_unary_session(ts.port)
+            try
+                first_stream = send_live_unary_request!(
+                    session,
+                    request_path,
+                    UInt8[0x11, 0x12],
+                )
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                    1.0,
+                ) === :ok
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status == ServerStatus.DRAINING, 1.0) === :ok
+
+                second_stream = send_live_unary_request!(
+                    session,
+                    request_path,
+                    UInt8[0x13, 0x14],
+                )
+                second_result = await_live_unary_response!(session, second_stream)
+                @test second_result.collector.grpc_status == Int(StatusCode.UNAVAILABLE)
+                @test second_result.collector.grpc_message !== nothing
+                @test occursin("draining", lowercase(second_result.collector.grpc_message))
+
+                first_result = await_live_unary_response!(session, first_stream)
+                @test first_result.collector.grpc_status == Int(StatusCode.OK)
+                @test first_result.body == build_grpc_message(UInt8[0x11, 0x12])
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            finally
+                close_live_http2_unary_session!(session)
+            end
         end
     end
 end

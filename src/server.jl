@@ -307,10 +307,13 @@ function _acquire_request_slot!(
 )::Symbol
     limit = server.config.max_concurrent_requests
     if isnothing(limit)
-        lock(server.request_admission) do
+        return lock(server.request_admission) do
+            if !_accepting_requests(server)
+                return :server_stopping
+            end
             server.active_requests += 1
+            return :acquired
         end
-        return :acquired
     end
 
     lock(server.request_admission)

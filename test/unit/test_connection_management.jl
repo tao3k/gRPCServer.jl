@@ -382,6 +382,17 @@ using .ConformanceData
             @test gRPCServer._request_admission_state(server).active_requests == 0
         end
 
+        @testset "Unlimited request admission rejects new work while draining" begin
+            server = GRPCServer("127.0.0.1", 50051)
+            server.status = ServerStatus.DRAINING
+
+            @test gRPCServer._acquire_request_slot!(server) == :server_stopping
+
+            state = gRPCServer._request_admission_state(server)
+            @test state.active_requests == 0
+            @test state.queued_requests == 0
+        end
+
         @testset "Queued request admission respects deadline" begin
             server = GRPCServer(
                 "127.0.0.1",

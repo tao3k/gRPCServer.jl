@@ -109,6 +109,41 @@ function ack_keepalive_rounds!(
     return rounds
 end
 
+function _keepalive_transport_closed(err)::Bool
+    if err isa EOFError || err isa Base.IOError
+        return true
+    elseif err isa ErrorException
+        return occursin(
+            "Transport EOF before keepalive ping arrived",
+            sprint(showerror, err),
+        )
+    end
+    return false
+end
+
+function ack_keepalive_until_closed!(
+    session::LiveHTTP2UnarySession,
+    ready_signal::Channel{Nothing};
+    timeout::Float64=1.0,
+)::Int
+    rounds = 0
+    signaled_ready = false
+    while true
+        try
+            ping = await_server_ping!(session; timeout=timeout)
+            ack_server_ping!(session, ping)
+            rounds += 1
+            if !signaled_ready
+                put!(ready_signal, nothing)
+                signaled_ready = true
+            end
+        catch err
+            _keepalive_transport_closed(err) && return rounds
+            rethrow()
+        end
+    end
+end
+
 function send_live_unary_request!(
     session::LiveHTTP2UnarySession,
     path::String,
@@ -566,6 +601,55 @@ end
                 stopper = @async stop!(ts.server; force=false, timeout=2.0)
                 @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
                 @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test isempty(ts.server.connections)
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.0) === :ok
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+                @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                if stopper !== nothing && !istaskdone(stopper)
+                    wait(stopper)
+                end
+            end
+        end
+    end
+
+    @testset "Graceful Stop Interrupts Concurrent Keepalive ACK Loops Cleanly" begin
+        with_test_server(keepalive_interval=0.1, keepalive_timeout=0.2) do ts
+            session_count = 6
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            ready_signal = Channel{Nothing}(session_count)
+            ack_tasks = Task[]
+            stopper = nothing
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                ack_tasks = [
+                    @async ack_keepalive_until_closed!(session, ready_signal; timeout=1.0) for
+                    session in sessions
+                ]
+
+                for _ in 1:session_count
+                    @test timedwait(() -> isready(ready_signal), 1.0) === :ok
+                    take!(ready_signal)
+                end
+
+                @test length(ts.server.connections) == session_count
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+                @test timedwait(() -> istaskdone(stopper), 1.5) === :ok
+                @test timedwait(() -> all(istaskdone, ack_tasks), 1.5) === :ok
+
+                rounds = fetch.(ack_tasks)
+                @test all(round -> round >= 1, rounds)
 
                 wait(stopper)
                 @test ts.server.status == ServerStatus.STOPPED

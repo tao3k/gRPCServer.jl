@@ -3,10 +3,224 @@
 
 using Test
 using gRPCServer
+using PureHTTP2
 using Sockets
 
 # TestUtils is included once in runtests.jl to avoid method redefinition warnings
 # using TestUtils is inherited from the parent module
+
+function run_live_unary_request(
+    port::Int,
+    path::String,
+    payload::Vector{UInt8};
+    extra_headers::Vector{Tuple{String,String}}=Tuple{String,String}[],
+)
+    tcp = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
+    conn = PureHTTP2.HTTP2Connection()
+    try
+        result = PureHTTP2.open_connection!(
+            conn,
+            tcp;
+            request_headers=vcat([
+                (":method", "POST"),
+                (":path", path),
+                (":scheme", "http"),
+                (":authority", "127.0.0.1:$port"),
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+            ], extra_headers),
+            request_body=build_grpc_message(payload),
+        )
+
+        collector = TestUtils.MockResponseCollector()
+        TestUtils.parse_response_headers!(collector, result.headers)
+        collector.data = result.body
+        return (; result, collector)
+    finally
+        close(tcp)
+    end
+end
+
+mutable struct LiveHTTP2UnarySession
+    port::Int
+    tcp::Sockets.TCPSocket
+    conn::PureHTTP2.HTTP2Connection
+    pending::Dict{UInt32, PureHTTP2.ClientStreamState}
+end
+
+function open_live_http2_unary_session(port::Int)
+    tcp = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
+    conn = PureHTTP2.HTTP2Connection()
+    conn.state = PureHTTP2.ConnectionState.OPEN
+    conn.next_stream_id = UInt32(1)
+    conn.pending_settings_ack = true
+    PureHTTP2._write_preface_and_settings!(conn, tcp)
+    return LiveHTTP2UnarySession(
+        port,
+        tcp,
+        conn,
+        Dict{UInt32, PureHTTP2.ClientStreamState}(),
+    )
+end
+
+function close_live_http2_unary_session!(session::LiveHTTP2UnarySession)
+    close(session.tcp)
+    return nothing
+end
+
+function await_server_ping!(
+    session::LiveHTTP2UnarySession;
+    timeout::Float64=1.0,
+)
+    deadline = time() + timeout
+    while time() < deadline
+        frame_timeout = max(deadline - time(), 0.05)
+        frame = try
+            gRPCServer.read_frame(session.tcp; idle_timeout=frame_timeout)
+        catch err
+            if err isa gRPCServer.IdleConnectionTimeoutError
+                continue
+            end
+            rethrow()
+        end
+        frame === nothing && error("Transport EOF before keepalive ping arrived")
+        if frame.header.frame_type == PureHTTP2.FrameType.PING &&
+           !PureHTTP2.has_flag(frame.header, PureHTTP2.FrameFlags.ACK)
+            return frame
+        end
+    end
+    error("Timed out waiting for server keepalive ping")
+end
+
+function ack_server_ping!(session::LiveHTTP2UnarySession, ping::PureHTTP2.Frame)
+    gRPCServer.write_frame(session.tcp, PureHTTP2.ping_frame(ping.payload; ack=true))
+    return nothing
+end
+
+function ack_keepalive_rounds!(
+    session::LiveHTTP2UnarySession;
+    rounds::Int,
+    timeout::Float64=1.0,
+)
+    for _ in 1:rounds
+        ping = await_server_ping!(session; timeout=timeout)
+        ack_server_ping!(session, ping)
+    end
+    return rounds
+end
+
+function _keepalive_transport_closed(err)::Bool
+    if err isa EOFError || err isa Base.IOError
+        return true
+    elseif err isa ErrorException
+        return occursin(
+            "Transport EOF before keepalive ping arrived",
+            sprint(showerror, err),
+        )
+    end
+    return false
+end
+
+function ack_keepalive_until_closed!(
+    session::LiveHTTP2UnarySession,
+    ready_signal::Channel{Nothing};
+    timeout::Float64=1.0,
+)::Int
+    rounds = 0
+    signaled_ready = false
+    while true
+        try
+            ping = await_server_ping!(session; timeout=timeout)
+            ack_server_ping!(session, ping)
+            rounds += 1
+            if !signaled_ready
+                put!(ready_signal, nothing)
+                signaled_ready = true
+            end
+        catch err
+            _keepalive_transport_closed(err) && return rounds
+            rethrow()
+        end
+    end
+end
+
+function keepalive_reuse_unary_roundtrip!(
+    session::LiveHTTP2UnarySession,
+    path::String,
+    payload::Vector{UInt8};
+    pre_request_rounds::Int=2,
+    post_request_rounds::Int=1,
+    timeout::Float64=1.0,
+)
+    ack_keepalive_rounds!(session; rounds=pre_request_rounds, timeout=timeout)
+    stream_id = send_live_unary_request!(session, path, payload)
+    result = await_live_unary_response!(session, stream_id)
+    ack_keepalive_rounds!(session; rounds=post_request_rounds, timeout=timeout)
+    return result
+end
+
+function send_live_unary_request!(
+    session::LiveHTTP2UnarySession,
+    path::String,
+    payload::Vector{UInt8};
+    extra_headers::Vector{Tuple{String,String}}=Tuple{String,String}[],
+)
+    stream_id = PureHTTP2._write_request!(
+        session.conn,
+        session.tcp,
+        vcat([
+            (":method", "POST"),
+            (":path", path),
+            (":scheme", "http"),
+            (":authority", "127.0.0.1:$(session.port)"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ], extra_headers),
+        build_grpc_message(payload),
+    )
+    session.pending[stream_id] = PureHTTP2.ClientStreamState(stream_id)
+    return stream_id
+end
+
+function await_live_unary_response!(
+    session::LiveHTTP2UnarySession,
+    stream_id::UInt32;
+    max_frame_size::Int=PureHTTP2.DEFAULT_MAX_FRAME_SIZE,
+)
+    while !PureHTTP2.is_closed(session.conn)
+        state = session.pending[stream_id]
+        if state.headers_complete && state.end_stream_received
+            break
+        end
+
+        frame = PureHTTP2._read_one_frame(session.tcp, max_frame_size)
+        if frame === nothing
+            if state.headers_complete && state.end_stream_received
+                break
+            end
+            error("Transport EOF before response complete for stream $stream_id")
+        end
+
+        exit_loop = PureHTTP2.client_dispatch_frame!(
+            session.conn,
+            session.tcp,
+            session.pending,
+            frame,
+        )
+        if exit_loop
+            updated_state = session.pending[stream_id]
+            if !(updated_state.headers_complete && updated_state.end_stream_received)
+                error("GOAWAY before response complete for stream $stream_id")
+            end
+        end
+    end
+
+    final_state = pop!(session.pending, stream_id)
+    collector = TestUtils.MockResponseCollector()
+    TestUtils.parse_response_headers!(collector, final_state.response_headers)
+    collector.data = take!(final_state.response_body)
+    return (; collector, headers=final_state.response_headers, body=collector.data)
+end
 
 @testset "Unary RPC Integration Tests" begin
     @testset "Basic Connection" begin
@@ -217,6 +431,540 @@ using Sockets
             connect!(client)
             @test ts.server.status == ServerStatus.RUNNING
             disconnect!(client)
+        end
+    end
+
+    @testset "Live Unary Request Admission Saturation" begin
+        descriptor = ServiceDescriptor(
+            "test.SaturationService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.3)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=1, max_queued_requests=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.SaturationService"] = HealthStatus.SERVING
+
+            request_path = "/test.SaturationService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x01, 0x02])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            second = @async run_live_unary_request(ts.port, request_path, UInt8[0x03, 0x04])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).queued_requests == 1,
+                1.0,
+            ) === :ok
+            @test !istaskdone(second)
+
+            third = @async run_live_unary_request(ts.port, request_path, UInt8[0x05, 0x06])
+            third_result = fetch(third)
+            @test third_result.collector.grpc_status == Int(StatusCode.RESOURCE_EXHAUSTED)
+            @test third_result.collector.grpc_message !== nothing
+            @test occursin("queue", lowercase(third_result.collector.grpc_message))
+
+            first_result = fetch(first)
+            second_result = fetch(second)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+            @test second_result.collector.grpc_status == Int(StatusCode.OK)
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+        end
+    end
+
+    @testset "Live Connection Admission Saturation" begin
+        descriptor = ServiceDescriptor(
+            "test.ConnectionLimitService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> req,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_connections=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.ConnectionLimitService"] = HealthStatus.SERVING
+
+            blocker = MockGRPCClient("127.0.0.1", ts.port)
+            @test connect!(blocker)
+            @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+            saturation_error = try
+                run_live_unary_request(
+                    ts.port,
+                    "/test.ConnectionLimitService/Echo",
+                    UInt8[0x07, 0x08],
+                )
+                nothing
+            catch err
+                err
+            end
+
+            @test saturation_error !== nothing
+            @test saturation_error isa Exception
+            @test length(ts.server.connections) == 1
+            @test is_connected(blocker)
+
+            disconnect!(blocker)
+            @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+        end
+    end
+
+    @testset "Graceful Stop Does Not Wait On Idle Connection" begin
+        with_test_server() do ts
+            blocker = MockGRPCClient("127.0.0.1", ts.port)
+            @test connect!(blocker)
+            @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+            stopper = @async stop!(ts.server; force=false, timeout=1.0)
+            @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+            @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+
+            wait(stopper)
+            @test ts.server.status == ServerStatus.STOPPED
+            @test isempty(ts.server.connections)
+
+            disconnect!(blocker)
+        end
+    end
+
+    @testset "Idle Timeout Closes Prefaced Idle Connection" begin
+        with_test_server(idle_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+                @test timedwait(() -> isempty(ts.server.connections), 1.5) === :ok
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.5) === :ok
+            finally
+                close_live_http2_unary_session!(session)
+            end
+        end
+    end
+
+    @testset "Keepalive Timeout Closes Prefaced Idle Connection" begin
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+                @test timedwait(() -> isempty(ts.server.connections), 1.5) === :ok
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.5) === :ok
+            finally
+                close_live_http2_unary_session!(session)
+            end
+        end
+    end
+
+    @testset "Keepalive ACK Preserves Prefaced Idle Connection" begin
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+                first_ping = await_server_ping!(session; timeout=1.0)
+                ack_server_ping!(session, first_ping)
+                @test length(ts.server.connections) == 1
+
+                second_ping = await_server_ping!(session; timeout=1.0)
+                ack_server_ping!(session, second_ping)
+                @test length(ts.server.connections) == 1
+            finally
+                close_live_http2_unary_session!(session)
+                @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+            end
+        end
+    end
+
+    @testset "Concurrent Keepalive ACK Soak Keeps Idle Sessions Stable And Stops Cleanly" begin
+        with_test_server(keepalive_interval=0.1, keepalive_timeout=0.2) do ts
+            session_count = 6
+            rounds = 3
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            stopper = nothing
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                soak_tasks = [
+                    @async ack_keepalive_rounds!(session; rounds=rounds, timeout=1.0) for
+                    session in sessions
+                ]
+                @test fetch.(soak_tasks) == fill(rounds, session_count)
+                @test length(ts.server.connections) == session_count
+                @test isempty(ts.server.connection_tasks) == false
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+                @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test isempty(ts.server.connections)
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.0) === :ok
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+                @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                if stopper !== nothing && !istaskdone(stopper)
+                    wait(stopper)
+                end
+            end
+        end
+    end
+
+    @testset "Graceful Stop Interrupts Concurrent Keepalive ACK Loops Cleanly" begin
+        with_test_server(keepalive_interval=0.1, keepalive_timeout=0.2) do ts
+            session_count = 6
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            ready_signal = Channel{Nothing}(session_count)
+            ack_tasks = Task[]
+            stopper = nothing
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                ack_tasks = [
+                    @async ack_keepalive_until_closed!(session, ready_signal; timeout=1.0) for
+                    session in sessions
+                ]
+
+                for _ in 1:session_count
+                    @test timedwait(() -> isready(ready_signal), 1.0) === :ok
+                    take!(ready_signal)
+                end
+
+                @test length(ts.server.connections) == session_count
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+                @test timedwait(() -> istaskdone(stopper), 1.5) === :ok
+                @test timedwait(() -> all(istaskdone, ack_tasks), 1.5) === :ok
+
+                rounds = fetch.(ack_tasks)
+                @test all(round -> round >= 1, rounds)
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test isempty(ts.server.connections)
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.0) === :ok
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+                @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                if stopper !== nothing && !istaskdone(stopper)
+                    wait(stopper)
+                end
+            end
+        end
+    end
+
+    @testset "Unary Reuse Works After Keepalive Cycles On Reused Sessions" begin
+        descriptor = ServiceDescriptor(
+            "test.KeepaliveReuseService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> req,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.KeepaliveReuseService"] = HealthStatus.SERVING
+
+            request_path = "/test.KeepaliveReuseService/Echo"
+            session_count = 4
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                payloads = [
+                    UInt8[0x21, UInt8(i), UInt8(i + 10)] for i in 1:session_count
+                ]
+                tasks = [
+                    @async keepalive_reuse_unary_roundtrip!(
+                        sessions[i],
+                        request_path,
+                        payloads[i];
+                        pre_request_rounds=2,
+                        post_request_rounds=1,
+                        timeout=1.0,
+                    ) for i in 1:session_count
+                ]
+
+                results = fetch.(tasks)
+                @test length(results) == session_count
+                @test all(
+                    result.collector.grpc_status == Int(StatusCode.OK) for result in results
+                )
+                @test all(
+                    results[i].body == build_grpc_message(payloads[i]) for i in 1:session_count
+                )
+                @test length(ts.server.connections) == session_count
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+            end
+        end
+    end
+
+    @testset "Live Unary Admission Deadline While Queued" begin
+        descriptor = ServiceDescriptor(
+            "test.DeadlineQueueService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=1, max_queued_requests=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.DeadlineQueueService"] = HealthStatus.SERVING
+
+            request_path = "/test.DeadlineQueueService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x09, 0x0A])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            started_at = time()
+            second_result = run_live_unary_request(
+                ts.port,
+                request_path,
+                UInt8[0x0B, 0x0C];
+                extra_headers=[("grpc-timeout", "100m")],
+            )
+            elapsed = time() - started_at
+
+            @test second_result.collector.grpc_status == Int(StatusCode.DEADLINE_EXCEEDED)
+            @test second_result.collector.grpc_message !== nothing
+            @test occursin("deadline", lowercase(second_result.collector.grpc_message))
+            @test elapsed < 0.25
+
+            first_result = fetch(first)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
+        end
+    end
+
+    @testset "Graceful Stop Preserves In-Flight Unary Request" begin
+        descriptor = ServiceDescriptor(
+            "test.GracefulDrainService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server() do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.GracefulDrainService"] = HealthStatus.SERVING
+
+            request_path = "/test.GracefulDrainService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x0D, 0x0E])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            stopper = @async stop!(ts.server; force=false, timeout=2.0)
+            @test timedwait(() -> ts.server.status == ServerStatus.DRAINING, 1.0) === :ok
+            @test timedwait(() -> istaskdone(stopper), 0.2) === :timed_out
+
+            drain_error = try
+                run_live_unary_request(ts.port, request_path, UInt8[0x0F, 0x10])
+                nothing
+            catch err
+                err
+            end
+            @test drain_error !== nothing
+
+            first_result = fetch(first)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+
+            wait(stopper)
+            @test ts.server.status == ServerStatus.STOPPED
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+        end
+    end
+
+    @testset "Graceful Stop Rejects New Stream On Existing Connection" begin
+        descriptor = ServiceDescriptor(
+            "test.GracefulDrainReuseService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        req == UInt8[0x11, 0x12] && sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server() do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.GracefulDrainReuseService"] = HealthStatus.SERVING
+
+            request_path = "/test.GracefulDrainReuseService/Echo"
+            session = open_live_http2_unary_session(ts.port)
+            try
+                first_stream = send_live_unary_request!(
+                    session,
+                    request_path,
+                    UInt8[0x11, 0x12],
+                )
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                    1.0,
+                ) === :ok
+
+                stopper = @async stop!(ts.server; force=false, timeout=2.0)
+                @test timedwait(() -> ts.server.status == ServerStatus.DRAINING, 1.0) === :ok
+
+                second_stream = send_live_unary_request!(
+                    session,
+                    request_path,
+                    UInt8[0x13, 0x14],
+                )
+                second_result = await_live_unary_response!(session, second_stream)
+                @test second_result.collector.grpc_status == Int(StatusCode.UNAVAILABLE)
+                @test second_result.collector.grpc_message !== nothing
+                @test occursin("draining", lowercase(second_result.collector.grpc_message))
+
+                first_result = await_live_unary_response!(session, first_stream)
+                @test first_result.collector.grpc_status == Int(StatusCode.OK)
+                @test first_result.body == build_grpc_message(UInt8[0x11, 0x12])
+
+                wait(stopper)
+                @test ts.server.status == ServerStatus.STOPPED
+                @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            finally
+                close_live_http2_unary_session!(session)
+            end
+        end
+    end
+
+    @testset "Live Unary Concurrent Soak Keeps Admission State Clean" begin
+        descriptor = ServiceDescriptor(
+            "test.ConcurrentUnarySoakService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.05)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=8, max_queued_requests=32) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.ConcurrentUnarySoakService"] = HealthStatus.SERVING
+
+            request_path = "/test.ConcurrentUnarySoakService/Echo"
+
+            for round in 1:3
+                payloads = [
+                    UInt8[UInt8(round), UInt8(i % 0xff), UInt8((i * 7) % 0xff)] for i in 1:24
+                ]
+                tasks = [
+                    @async run_live_unary_request(ts.port, request_path, payload) for
+                    payload in payloads
+                ]
+
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).active_requests >= 4,
+                    1.0,
+                ) === :ok
+                @test timedwait(
+                    () -> gRPCServer._request_admission_state(ts.server).queued_requests >= 1,
+                    1.0,
+                ) === :ok
+
+                results = fetch.(tasks)
+                @test length(results) == length(payloads)
+                @test all(
+                    result.collector.grpc_status == Int(StatusCode.OK) for result in results
+                )
+                @test all(
+                    result.collector.data == build_grpc_message(payloads[i]) for
+                    (i, result) in pairs(results)
+                )
+
+                @test timedwait(
+                    () -> begin
+                        state = gRPCServer._request_admission_state(ts.server)
+                        state.active_requests == 0 && state.queued_requests == 0
+                    end,
+                    1.0,
+                ) === :ok
+            end
         end
     end
 end

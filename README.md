@@ -26,6 +26,21 @@ Full documentation is available at [s-celles.github.io/gRPCServer.jl](https://s-
 - Julia 1.10 or later
 - ProtoBuf.jl for message serialization
 
+## Operational Limits
+
+`ServerConfig.max_connections`, `max_concurrent_requests`, and
+`max_queued_requests` are enforced by the runtime. Excess accepted connections
+are closed at the server boundary, and requests beyond the active plus queued
+budget are rejected with `RESOURCE_EXHAUSTED`. Queued requests also honor the
+incoming `grpc-timeout` deadline while waiting for server capacity. A graceful
+`stop!(server; force=false)` closes the listener, keeps admitted requests alive
+through drain, closes remaining idle connections once in-flight requests are
+finished, and refuses new work while the server is draining, including new
+streams opened on existing HTTP/2 connections. `keepalive_interval` and
+`keepalive_timeout` are also runtime-owned: when `keepalive_interval` wins the
+next idle wait, the server emits a connection-level HTTP/2 PING and closes the
+connection if the matching ACK is not received before `keepalive_timeout`.
+
 ## Related Packages
 
 - [gRPCClient.jl](https://github.com/JuliaIO/gRPCClient.jl) - gRPC client for Julia

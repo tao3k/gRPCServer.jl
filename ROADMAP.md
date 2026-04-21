@@ -17,43 +17,39 @@ Server streaming RPC methods now work correctly via grpcurl.
 
 ### gRPCClient.jl Integration Tests
 
-**Status**: Not Started
+**Status**: Complete
 
-The constitution requires integration tests against [gRPCClient.jl](https://github.com/JuliaIO/gRPCClient.jl) to validate client-server interoperability within the Julia gRPC ecosystem.
+Integration tests against [gRPCClient.jl](https://github.com/JuliaIO/gRPCClient.jl) validate client-server interoperability within the Julia gRPC ecosystem.
 
-**Tasks**:
-- [ ] Add gRPCClient.jl as a test dependency
-- [ ] Create `test/integration/test_grpcclient.jl`
-- [ ] Test all RPC patterns (unary, server streaming, client streaming, bidirectional)
-- [ ] Test error handling and status code propagation
-- [ ] Test metadata/header passing
-- [ ] Test compression negotiation
+**Completed**:
+- [x] Add gRPCClient.jl as a test dependency
+- [x] Create `test/integration/test_grpcclient.jl`
+- [x] Test all RPC patterns (unary, server streaming, client streaming, bidirectional)
+- [x] Test error handling and status code propagation
+- [x] Test compression negotiation
+
+**Notes**:
+- Streaming tests (server, client, bidi) require Julia >= 1.12 and are version-gated
+- Unary and error tests run on all Julia versions (1.10+)
+- Fixed HTTP/2 ENABLE_PUSH compliance (RFC 9113) discovered during testing
+- Metadata/header passing tests deferred to a follow-up
 
 ### Full mTLS Client Verification
 
-**Status**: Not Started (blocked on upstream)
+**Status**: ✅ Complete (via Reseau.jl)
 
-OpenSSL.jl does not expose `ssl_set_verify` and `ssl_load_client_ca_file`, so full mTLS client certificate verification is not currently possible.
+Delivered in feature 018-reseau-tls-alpn by switching the TLS backend from OpenSSL.jl to [Reseau.jl](https://github.com/JuliaServices/Reseau.jl). The OpenSSL.jl upstream work originally planned (contributing `SSL_CTX_set_verify` bindings) is no longer needed — Reseau.jl exposes the required verification primitives via its `ClientAuthMode` path.
 
-**Current state**: Client CA can be loaded but verification is not enforced (see `src/tls/config.jl:66-68`).
-
-**Approach**: Contribute missing bindings upstream to [OpenSSL.jl](https://github.com/JuliaWeb/OpenSSL.jl) rather than implementing local ccall workarounds.
-
-**Upstream Tasks**:
-- [ ] Open issue on OpenSSL.jl requesting mTLS verification support
-- [ ] Contribute `SSL_CTX_set_verify` binding to OpenSSL.jl
-- [ ] Contribute `SSL_CTX_load_verify_locations` binding to OpenSSL.jl
-- [ ] Contribute `SSL_get_verify_result` binding to OpenSSL.jl
-
-**Local Tasks** (after upstream merge):
-- [ ] Update gRPCServer.jl to use new OpenSSL.jl bindings
-- [ ] Add tests for mTLS with valid/invalid client certificates
-- [ ] Update documentation with mTLS configuration examples
+**Completed**:
+- [x] Real server-side ALPN selection during the TLS handshake (`SSL_CTX_set_alpn_select_cb`), with the negotiated protocol read back via `SSL_get0_alpn_selected` instead of inferred
+- [x] mTLS client certificate verification actually enforced when `require_client_cert = true`, via Reseau's `ClientAuthMode`
+- [x] Atomic `reload_tls!` that swaps the active TLS configuration without rebinding the listening socket or dropping in-flight handshakes
+- [x] Handshake failures classified per `TLSHandshakeFailureKind` (CONFIG_ERROR, ALPN_MISMATCH, PEER_CERT_REJECTED, HANDSHAKE_IO_ERROR) with distinguishable log lines
+- [x] New `docs/src/tls.md` operator walkthrough
+- [x] New `test/integration/test_tls_interop.jl` exercising the listener against Reseau.TLS, `openssl s_client`, and `grpcurl`
 
 **References**:
-- [OpenSSL.jl GitHub](https://github.com/JuliaWeb/OpenSSL.jl)
-- [OpenSSL.jl Issues](https://github.com/JuliaWeb/OpenSSL.jl/issues) (no existing mTLS issue as of 2026-01-15)
-- [OpenSSL SSL_CTX_set_verify](https://www.openssl.org/docs/man3.0/man3/SSL_CTX_set_verify.html)
+- [Reseau.jl](https://github.com/JuliaServices/Reseau.jl)
 - [gRPC Authentication Guide](https://grpc.io/docs/guides/auth/)
 
 ### Documentation Build Strictness
@@ -69,6 +65,35 @@ The documentation build now runs in strict mode with no `warnonly` exceptions.
 - [x] Updated `devbranch` to `develop` for Git flow compatibility
 
 ## Medium Priority
+
+### Externalize HTTP/2 Module
+
+**Status**: Step 1 ✅ Complete (feature 019-http2-backend-abstraction); Step 2 deferred
+
+The in-tree `src/http2/` module duplicated code that had been extracted into [PureHTTP2.jl](https://github.com/s-celles/PureHTTP2.jl). Feature 019 removed that duplication and shipped a lightweight backend abstraction so future alternatives like [Nghttp2Wrapper.jl](https://github.com/s-celles/Nghttp2Wrapper.jl) or [HTTP.jl](https://github.com/JuliaWeb/HTTP.jl) ([JuliaWeb/HTTP.jl#1248](https://github.com/JuliaWeb/HTTP.jl/pull/1248)) can plug in without modifying gRPCServer core.
+
+**Completed (Step 1)**:
+- [x] Added PureHTTP2.jl as a runtime dependency (URL-based until registration)
+- [x] Defined `AbstractHTTP2Backend` / `PureHTTP2Backend` / `create_connection` in `src/http2_backend.jl` — connection-factory pattern, zero per-request overhead
+- [x] Added `http2_backend` keyword/field on `GRPCServer`; `handle_connection` dispatches through it
+- [x] Deleted `src/http2/` (~3,100 lines: frames.jl, hpack.jl, stream.jl, flow_control.jl, connection.jl)
+- [x] Full test suite passes (9336 tests); no benchmark regressions (see `benchmark/BASELINE.md`)
+- [x] New `docs/src/http2-backends.md` documenting the backend interface
+
+**Step 2 (deferred — only if multiple backends are actually wanted)**:
+- [ ] Add weakdep extensions (`Nghttp2WrapperExt`, `HTTPjlExt`) once a second backend is validated end-to-end
+  - Intentionally not designed yet: PureHTTP2.jl is currently the reference shape of the interface, and baking in a second backend's quirks prematurely would cost more than it saves
+  - The `AbstractHTTP2Backend` shim is already in place; extensions only need to implement `create_connection` and adapt their native types to the expected field interface
+
+**Tradeoffs for Step 2:**
+- Nghttp2Wrapper: most battle-tested protocol correctness (libnghttp2 is the reference C impl), but adds a binary dependency.
+- HTTP.jl #1248: keeps the stack pure-Julia and aligned with JuliaWeb, but blocked on upstream merge.
+- PureHTTP2: now the default — zero migration cost, same bugs gRPCServer would inherit anyway.
+
+**References**:
+- [PureHTTP2.jl](https://github.com/s-celles/PureHTTP2.jl) (extracted from this module)
+- [Nghttp2Wrapper.jl](https://github.com/s-celles/Nghttp2Wrapper.jl)
+- [JuliaWeb/HTTP.jl#1248 — HTTP/2 support](https://github.com/JuliaWeb/HTTP.jl/pull/1248)
 
 ### Code Coverage Improvements
 
@@ -168,8 +193,9 @@ A security audit would help identify vulnerabilities in the HTTP/2 and TLS imple
 
 - [x] Core gRPC server implementation
 - [x] All four RPC patterns (unary, server/client/bidi streaming)
-- [x] HTTP/2 protocol support with HPACK compression
-- [x] TLS/mTLS support
+- [x] HTTP/2 protocol support with HPACK compression (via [PureHTTP2.jl](https://github.com/s-celles/PureHTTP2.jl), pluggable via `AbstractHTTP2Backend`)
+- [x] TLS/mTLS support (via [Reseau.jl](https://github.com/JuliaServices/Reseau.jl), with real server-side ALPN selection and enforced client certificate verification)
+- [x] Atomic TLS certificate reload (`reload_tls!`)
 - [x] Health checking service
 - [x] Reflection service with file descriptors
 - [x] Interceptor framework
@@ -177,8 +203,9 @@ A security audit would help identify vulnerabilities in the HTTP/2 and TLS imple
 - [x] Aqua.jl quality tests
 - [x] Unit tests
 - [x] Integration tests
+- [x] TLS interoperability tests (Reseau.TLS, `openssl s_client`, `grpcurl`)
 - [x] Contract tests (grpcurl)
-- [x] Documentation with Documenter.jl
+- [x] Documentation with Documenter.jl (strict mode, no `warnonly`)
 - [x] CI/CD pipeline
 - [x] CODE_OF_CONDUCT.md
 - [x] CONTRIBUTING.md
@@ -187,4 +214,4 @@ A security audit would help identify vulnerabilities in the HTTP/2 and TLS imple
 
 ---
 
-*Last updated: 2026-01-15*
+*Last updated: 2026-04-17*

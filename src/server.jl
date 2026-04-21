@@ -53,13 +53,21 @@ mutable struct GRPCServer
     # Internal state
     socket::Union{Sockets.TCPServer, Nothing}
     connections::Vector{Any}  # Active connections
+    accept_task::Union{Task, Nothing}
+    connection_tasks::Vector{Task}
     lock::ReentrantLock
-    shutdown_event::Condition
+    request_admission::Base.GenericCondition{ReentrantLock}
+    active_requests::Int
+    queued_requests::Int
+    shutdown_event::Base.Event
     last_error::Union{Exception, Nothing}
 
     # TLS state
-    """Cached SSL context for TLS mode. Created at server startup when TLS is configured."""
-    ssl_context::Any  # Union{OpenSSL.SSLContext, Nothing} - using Any to avoid type dep
+    """TLS transport for TLS mode. Created at server startup when TLS is configured."""
+    tls_transport::Union{TLSTransport, Nothing}
+
+    # HTTP/2 backend (pluggable)
+    http2_backend::AbstractHTTP2Backend
 
     function GRPCServer(
         host::String,
@@ -84,7 +92,8 @@ mutable struct GRPCServer
             CompressionCodec.GZIP,
             CompressionCodec.DEFLATE,
             CompressionCodec.IDENTITY
-        ]
+        ],
+        http2_backend::AbstractHTTP2Backend=PureHTTP2Backend()
     )
         # Validate host and port
         if port < 1 || port > 65535
@@ -120,10 +129,16 @@ mutable struct GRPCServer
             Dict{String, HealthStatus.T}(),
             nothing,
             [],
-            ReentrantLock(),
-            Condition(),
             nothing,
-            nothing  # ssl_context - initialized in start!() when TLS configured
+            Task[],
+            ReentrantLock(),
+            Base.GenericCondition{ReentrantLock}(ReentrantLock()),
+            0,
+            0,
+            Base.Event(),
+            nothing,
+            nothing,  # tls_transport - initialized in start!() when TLS configured
+            http2_backend
         )
 
         # Add logging interceptor if requested
@@ -134,6 +149,12 @@ mutable struct GRPCServer
         return server
     end
 end
+
+mutable struct ConnectionKeepaliveState
+    pending_ping_payload::Union{Nothing, Vector{UInt8}}
+end
+
+ConnectionKeepaliveState() = ConnectionKeepaliveState(nothing)
 
 """
     register!(server::GRPCServer, service)
@@ -216,6 +237,194 @@ function add_interceptor!(server::GRPCServer, service_name::String, interceptor:
     add_interceptor!(server.dispatcher, service_name, interceptor)
 end
 
+function _track_connection_task!(server::GRPCServer, task::Task)
+    lock(server.lock) do
+        push!(server.connection_tasks, task)
+    end
+    return task
+end
+
+function _forget_connection_task!(server::GRPCServer, task::Task)
+    lock(server.lock) do
+        filter!(tracked -> tracked !== task, server.connection_tasks)
+    end
+    return nothing
+end
+
+function _trim_connection_tasks!(server::GRPCServer)
+    lock(server.lock) do
+        filter!(task -> !istaskdone(task), server.connection_tasks)
+    end
+    return nothing
+end
+
+function _clear_accept_task!(server::GRPCServer, task::Task=current_task())
+    lock(server.lock) do
+        server.accept_task === task && (server.accept_task = nothing)
+    end
+    return nothing
+end
+
+function _accepting_requests(server::GRPCServer)::Bool
+    return server.status == ServerStatus.RUNNING
+end
+
+function _serving_inflight_requests(server::GRPCServer)::Bool
+    return server.status in (ServerStatus.RUNNING, ServerStatus.DRAINING)
+end
+
+function _try_register_connection!(server::GRPCServer, client)::Bool
+    lock(server.lock) do
+        limit = server.config.max_connections
+        if !isnothing(limit) && length(server.connections) >= limit
+            return false
+        end
+        push!(server.connections, client)
+        return true
+    end
+end
+
+function _unregister_connection!(server::GRPCServer, client)
+    lock(server.lock) do
+        filter!(c -> c !== client, server.connections)
+    end
+    return nothing
+end
+
+function _request_admission_state(server::GRPCServer)
+    lock(server.request_admission) do
+        return (
+            active_requests=server.active_requests,
+            queued_requests=server.queued_requests,
+        )
+    end
+end
+
+function _request_admission_drained(server::GRPCServer)::Bool
+    lock(server.request_admission) do
+        return server.active_requests == 0 && server.queued_requests == 0
+    end
+end
+
+function _notify_request_admission_waiters!(server::GRPCServer)
+    lock(server.request_admission) do
+        notify(server.request_admission; all=true)
+    end
+    return nothing
+end
+
+function _acquire_request_slot!(
+    server::GRPCServer;
+    deadline::Union{Nothing,DateTime}=nothing,
+)::Symbol
+    limit = server.config.max_concurrent_requests
+    if isnothing(limit)
+        return lock(server.request_admission) do
+            if !_accepting_requests(server)
+                return :server_stopping
+            end
+            server.active_requests += 1
+            return :acquired
+        end
+    end
+
+    lock(server.request_admission)
+    try
+        while true
+            if !_accepting_requests(server)
+                return :server_stopping
+            elseif !isnothing(deadline) && deadline <= now()
+                return :deadline_exceeded
+            elseif server.active_requests < limit
+                server.active_requests += 1
+                return :acquired
+            elseif server.queued_requests >= server.config.max_queued_requests
+                return :queue_full
+            end
+
+            server.queued_requests += 1
+            timer = nothing
+            try
+                if !isnothing(deadline)
+                    remaining = Dates.value(deadline - now()) / 1000.0
+                    if remaining <= 0
+                        return :deadline_exceeded
+                    end
+                    timer = Timer(_ -> begin
+                        lock(server.request_admission)
+                        try
+                            notify(server.request_admission; all=true)
+                        finally
+                            unlock(server.request_admission)
+                        end
+                    end, remaining)
+                end
+                wait(server.request_admission)
+            finally
+                timer !== nothing && close(timer)
+                server.queued_requests -= 1
+            end
+        end
+    finally
+        unlock(server.request_admission)
+    end
+end
+
+function _release_request_slot!(server::GRPCServer)
+    lock(server.request_admission) do
+        server.active_requests > 0 && (server.active_requests -= 1)
+        notify(server.request_admission; all=true)
+    end
+    return nothing
+end
+
+function _server_tasks_idle(server::GRPCServer)
+    lock(server.lock) do
+        accept_idle = isnothing(server.accept_task) || istaskdone(server.accept_task)
+        connection_idle = all(istaskdone, server.connection_tasks)
+        return accept_idle && connection_idle
+    end
+end
+
+function _close_listener!(server::GRPCServer)
+    if server.socket !== nothing
+        try
+            close(server.socket)
+        catch
+        end
+        server.socket = nothing
+    end
+    if server.tls_transport !== nothing
+        try
+            close(server.tls_transport)
+        catch
+        end
+        server.tls_transport = nothing
+    end
+    return nothing
+end
+
+function _wait_for_server_tasks!(server::GRPCServer, timeout::Float64)
+    _trim_connection_tasks!(server)
+    timeout <= 0 && return _server_tasks_idle(server)
+
+    wait_status = timedwait(() -> begin
+        _trim_connection_tasks!(server)
+        return _server_tasks_idle(server)
+    end, timeout; pollint=0.05)
+    _trim_connection_tasks!(server)
+    wait_status === :ok && return true
+
+    accept_task_active, active_connection_tasks = lock(server.lock) do
+        return (
+            !isnothing(server.accept_task) && !istaskdone(server.accept_task),
+            count(task -> !istaskdone(task), server.connection_tasks),
+        )
+    end
+    @warn "Timed out waiting for gRPC server tasks to stop" timeout accept_task_active active_connection_tasks
+    return false
+end
+
 """
     start!(server::GRPCServer)
 
@@ -238,55 +447,59 @@ function start!(server::GRPCServer)
         throw(InvalidServerStateError(:STOPPED, Symbol(server.status)))
     end
 
+    reset(server.shutdown_event)
     server.status = ServerStatus.STARTING
     server.last_error = nothing
 
     try
-        # Initialize TLS if configured
-        if server.config.tls !== nothing
-            @info "Initializing TLS..." cert=server.config.tls.cert_chain
-            # Verify TLS configuration first
-            if !verify_tls_config(server.config.tls)
-                throw(TLSError("Invalid TLS configuration - certificate or key files not found"))
-            end
-            # Create and cache SSL context
-            server.ssl_context = create_ssl_context(server.config.tls)
-            @info "TLS initialized successfully"
-        end
-
         # Auto-register built-in services if enabled
         register_builtin_services!(server)
 
-        # Parse host
-        addr = if server.host == "0.0.0.0" || server.host == ""
-            IPv4(0)
-        elseif server.host == "::"
-            IPv6(0)
+        if server.config.tls !== nothing
+            @info "Initializing TLS..." cert=server.config.tls.cert_chain alpn=server.config.tls.alpn_protocols
+            server.tls_transport = TLSTransport(server.config.tls, server.host, server.port)
+            server.status = ServerStatus.RUNNING
+            @info "gRPC server started (TLS)" host=server.host port=server.port alpn=server.config.tls.alpn_protocols
         else
-            try
-                parse(IPv4, server.host)
-            catch
+            # Parse host
+            addr = if server.host == "0.0.0.0" || server.host == ""
+                IPv4(0)
+            elseif server.host == "::"
+                IPv6(0)
+            else
                 try
-                    parse(IPv6, server.host)
+                    parse(IPv4, server.host)
                 catch
-                    # Try DNS resolution
-                    getaddrinfo(server.host)
+                    try
+                        parse(IPv6, server.host)
+                    catch
+                        # Try DNS resolution
+                        getaddrinfo(server.host)
+                    end
                 end
             end
+
+            server.socket = listen(addr, server.port)
+            server.status = ServerStatus.RUNNING
+            @info "gRPC server started" host=server.host port=server.port tls=false
         end
 
-        # Bind socket
-        server.socket = listen(addr, server.port)
-        server.status = ServerStatus.RUNNING
-
-        @info "gRPC server started" host=server.host port=server.port tls=(server.config.tls !== nothing)
-
         # Start accept loop in background
-        @async accept_loop(server)
+        server.accept_task = @async begin
+            try
+                accept_loop(server)
+            finally
+                _clear_accept_task!(server)
+            end
+        end
 
     catch e
         server.status = ServerStatus.STOPPED
         server.last_error = e
+        server.accept_task = nothing
+        if e isa TLSHandshakeError
+            rethrow()
+        end
         throw(BindError("Failed to bind to $(server.host):$(server.port)", e))
     end
 end
@@ -353,40 +566,42 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
     if force
         # Immediate shutdown
         server.status = ServerStatus.STOPPING
+        _notify_request_admission_waiters!(server)
+        _close_listener!(server)
         close_all_connections(server)
-        if server.socket !== nothing
-            close(server.socket)
-            server.socket = nothing
-        end
+        _wait_for_server_tasks!(server, timeout > 0 ? timeout : 5.0)
         server.status = ServerStatus.STOPPED
     else
         # Graceful shutdown
         server.status = ServerStatus.DRAINING
+        _notify_request_admission_waiters!(server)
 
         # Stop accepting new connections
-        if server.socket !== nothing
-            close(server.socket)
-            server.socket = nothing
-        end
+        _close_listener!(server)
 
         # Wait for in-flight requests
         drain_time = timeout > 0 ? timeout : server.config.drain_timeout
         drain_deadline = time() + drain_time
-
-        while !isempty(server.connections) && time() < drain_deadline
-            sleep(0.1)
+        wait_status = timedwait(
+            () -> _request_admission_drained(server),
+            drain_time;
+            pollint=0.05,
+        )
+        if wait_status != :ok
+            state = _request_admission_state(server)
+            @warn "Timed out waiting for in-flight requests during graceful shutdown" timeout=drain_time active_requests=state.active_requests queued_requests=state.queued_requests
         end
 
         # Force close remaining connections
         server.status = ServerStatus.STOPPING
+        _notify_request_admission_waiters!(server)
         close_all_connections(server)
+        _wait_for_server_tasks!(server, max(drain_deadline - time(), 0.0))
         server.status = ServerStatus.STOPPED
     end
 
     @info "gRPC server stopped"
-    lock(server.lock) do
-        notify(server.shutdown_event)
-    end
+    notify(server.shutdown_event)
 end
 
 """
@@ -413,10 +628,8 @@ function Base.run(server::GRPCServer; block::Bool=true)
     start!(server)
 
     if block
-        # Wait for shutdown without holding the lock
-        # The shutdown_event is a simple Condition that doesn't require a lock
         try
-            while server.status == ServerStatus.RUNNING
+            while server.status != ServerStatus.STOPPED
                 wait(server.shutdown_event)
             end
         catch e
@@ -493,44 +706,29 @@ function reload_tls!(server::GRPCServer)
     end
 
     @info "Reloading TLS certificates"
-    # TLS reload implementation would go here
-    # This requires OpenSSL.jl integration
+    if server.tls_transport !== nothing
+        reload!(server.tls_transport, server.config.tls)
+    end
 end
 
 # Internal functions
 
 function accept_loop(server::GRPCServer)
-    while server.status == ServerStatus.RUNNING && server.socket !== nothing
+    if server.tls_transport !== nothing
+        _tls_accept_loop(server)
+    else
+        _plain_accept_loop(server)
+    end
+end
+
+function _plain_accept_loop(server::GRPCServer)
+    while _accepting_requests(server) && server.socket !== nothing
         try
             client = accept(server.socket)
-
-            # Wrap with TLS if configured
-            if server.ssl_context !== nothing
-                try
-                    # Wrap socket with TLS
-                    ssl_socket = wrap_socket_tls(client, server.ssl_context)
-
-                    # Verify ALPN negotiated HTTP/2
-                    if !verify_http2_negotiated(ssl_socket)
-                        @warn "ALPN negotiation failed - h2 protocol not negotiated"
-                        close_tls_socket(ssl_socket)
-                        continue
-                    end
-
-                    @async handle_connection(server, ssl_socket)
-                catch tls_err
-                    @warn "TLS handshake failed" exception=tls_err
-                    try
-                        close(client)
-                    catch
-                    end
-                    continue  # Continue accepting new connections
-                end
-            else
-                @async handle_connection(server, client)
-            end
+            task = @async handle_connection(server, client)
+            _track_connection_task!(server, task)
         catch e
-            if server.status != ServerStatus.RUNNING
+            if !_accepting_requests(server)
                 break  # Expected during shutdown
             end
             @error "Error accepting connection" exception=e
@@ -538,9 +736,34 @@ function accept_loop(server::GRPCServer)
     end
 end
 
+function _tls_accept_loop(server::GRPCServer)
+    transport = server.tls_transport
+    while _accepting_requests(server) && isopen(transport)
+        try
+            neg = accept_one(transport)
+            task = @async handle_connection(server, neg.io)
+            _track_connection_task!(server, task)
+        catch e
+            if e isa TLSHandshakeError
+                _log_tls_handshake_error(e)
+                continue
+            elseif !_accepting_requests(server)
+                break
+            else
+                @error "Error accepting TLS connection" exception=e
+            end
+        end
+    end
+end
+
 function handle_connection(server::GRPCServer, client)
-    lock(server.lock) do
-        push!(server.connections, client)
+    if !_try_register_connection!(server, client)
+        @warn "Rejecting connection at configured capacity" max_connections=server.config.max_connections
+        try
+            close(client)
+        catch
+        end
+        return
     end
 
     try
@@ -550,11 +773,19 @@ function handle_connection(server::GRPCServer, client)
 
         @debug "New connection" peer=peer
 
-        # Create HTTP/2 connection manager
-        conn = HTTP2Connection()
+        # Create HTTP/2 connection manager via backend
+        conn = create_connection(server.http2_backend)
 
         # Read and validate client connection preface
-        preface_data = read_connection_preface(client)
+        preface_data = try
+            read_connection_preface(client; idle_timeout=server.config.idle_timeout)
+        catch e
+            if e isa IdleConnectionTimeoutError
+                @debug "Closing idle connection before preface" peer=peer timeout=e.timeout_seconds
+                return
+            end
+            rethrow()
+        end
         if preface_data === nothing
             @debug "Client disconnected before sending preface"
             return
@@ -576,11 +807,24 @@ function handle_connection(server::GRPCServer, client)
 
         @debug "Server SETTINGS sent, starting frame processing loop"
 
+        keepalive = ConnectionKeepaliveState()
+
         # Main frame processing loop
-        while isopen(client) && is_open(conn) && server.status == ServerStatus.RUNNING
+        while isopen(client) && is_open(conn) && _serving_inflight_requests(server)
             @debug "Waiting for next frame..."
             # Read next frame
-            frame = read_frame(client)
+            frame = try
+                _read_connection_frame!(server, client, keepalive)
+            catch e
+                if e isa IdleConnectionTimeoutError
+                    @debug "Closing idle connection after inactivity" peer=peer timeout=e.timeout_seconds
+                    break
+                elseif e isa KeepaliveTimeoutError
+                    @debug "Closing connection after missed keepalive ACK" peer=peer timeout=e.timeout_seconds
+                    break
+                end
+                rethrow()
+            end
             if frame === nothing
                 @debug "read_frame returned nothing, breaking loop"
                 break  # Connection closed
@@ -590,15 +834,9 @@ function handle_connection(server::GRPCServer, client)
 
             try
                 # Process frame and get response frames
-                response_frames = process_frame(conn, frame)
+                response_frames = _process_connection_frame!(conn, client, frame)
 
                 @debug "process_frame returned" num_response_frames=length(response_frames)
-
-                # Send response frames
-                for resp_frame in response_frames
-                    @debug "Sending response frame" type=resp_frame.header.frame_type stream_id=resp_frame.header.stream_id
-                    write_frame(client, resp_frame)
-                end
 
                 # Check for completed streams (END_STREAM received)
                 @debug "Checking for completed streams"
@@ -614,6 +852,8 @@ function handle_connection(server::GRPCServer, client)
                     # Send RST_STREAM and continue
                     rst = send_rst_stream(conn, e.stream_id, e.error_code)
                     write_frame(client, rst)
+                elseif e isa EOFError || e isa Base.IOError
+                    break
                 else
                     # Unexpected error - send GOAWAY with INTERNAL_ERROR
                     @error "Unexpected error in frame processing" exception=(e, catch_backtrace())
@@ -633,10 +873,8 @@ function handle_connection(server::GRPCServer, client)
             close(client)
         catch
         end
-
-        lock(server.lock) do
-            filter!(c -> c !== client, server.connections)
-        end
+        _forget_connection_task!(server, current_task())
+        _unregister_connection!(server, client)
     end
 end
 
@@ -646,28 +884,230 @@ end
 Read exactly n bytes from io into buf. Returns the number of bytes read.
 Throws EOFError if connection is closed before reading n bytes.
 """
-function read_exactly!(io::IO, buf::Vector{UInt8}, n::Int)::Int
+struct IdleConnectionTimeoutError <: Exception
+    timeout_seconds::Float64
+end
+
+struct KeepaliveTimeoutError <: Exception
+    timeout_seconds::Float64
+end
+
+function Base.showerror(io::IO, err::IdleConnectionTimeoutError)
+    print(io, "idle connection timed out after ", err.timeout_seconds, " seconds")
+    return nothing
+end
+
+function Base.showerror(io::IO, err::KeepaliveTimeoutError)
+    print(io, "keepalive probe timed out after ", err.timeout_seconds, " seconds")
+    return nothing
+end
+
+@inline function _idle_timeout_deadline_ns(timeout_seconds::Float64)::Int64
+    return time_ns() + ceil(Int64, timeout_seconds * 1.0e9)
+end
+
+function _next_connection_liveness_timeout(
+    server::GRPCServer,
+    keepalive::ConnectionKeepaliveState,
+)::Tuple{Union{Nothing, Float64}, Symbol}
+    if keepalive.pending_ping_payload !== nothing
+        return (server.config.keepalive_timeout, :keepalive_ack)
+    end
+
+    keepalive_interval = server.config.keepalive_interval
+    idle_timeout = server.config.idle_timeout
+
+    if !isnothing(keepalive_interval) &&
+       (isnothing(idle_timeout) || keepalive_interval <= idle_timeout)
+        return (keepalive_interval, :keepalive_probe)
+    elseif !isnothing(idle_timeout)
+        return (idle_timeout, :idle_timeout)
+    end
+
+    return (nothing, :none)
+end
+
+function _next_keepalive_payload()::Vector{UInt8}
+    nonce = UInt64(time_ns())
+    payload = Vector{UInt8}(undef, 8)
+    for (idx, shift) in enumerate(56:-8:0)
+        payload[idx] = UInt8((nonce >> shift) & 0xff)
+    end
+    return payload
+end
+
+function _start_keepalive_probe!(
+    io::IO,
+    keepalive::ConnectionKeepaliveState,
+)::Vector{UInt8}
+    payload = _next_keepalive_payload()
+    keepalive.pending_ping_payload = payload
+    write_frame(io, ping_frame(payload))
+    return payload
+end
+
+function _clear_keepalive_probe!(keepalive::ConnectionKeepaliveState)
+    keepalive.pending_ping_payload = nothing
+    return nothing
+end
+
+function _matches_keepalive_ack(
+    keepalive::ConnectionKeepaliveState,
+    frame::Frame,
+)::Bool
+    payload = keepalive.pending_ping_payload
+    payload === nothing && return false
+    return frame.header.frame_type == FrameType.PING &&
+           has_flag(frame.header, FrameFlags.ACK) &&
+           frame.payload == payload
+end
+
+function _arm_read_deadline!(::IO, ::Nothing)
+    return nothing
+end
+
+function _arm_read_deadline!(::IO, ::Float64)
+    return nothing
+end
+
+function _arm_read_deadline!(conn::Reseau.TCP.Conn, timeout_seconds::Float64)
+    Reseau.TCP.set_read_deadline!(conn, _idle_timeout_deadline_ns(timeout_seconds))
+    return nothing
+end
+
+function _arm_read_deadline!(conn::Reseau.TLS.Conn, timeout_seconds::Float64)
+    Reseau.TLS.set_read_deadline!(conn, _idle_timeout_deadline_ns(timeout_seconds))
+    return nothing
+end
+
+function _clear_read_deadline!(::IO, ::Nothing)
+    return nothing
+end
+
+function _clear_read_deadline!(::IO, ::Float64)
+    return nothing
+end
+
+function _clear_read_deadline!(conn::Reseau.TCP.Conn, ::Float64)
+    Reseau.TCP.set_read_deadline!(conn, 0)
+    return nothing
+end
+
+function _clear_read_deadline!(conn::Reseau.TLS.Conn, ::Float64)
+    Reseau.TLS.set_read_deadline!(conn, 0)
+    return nothing
+end
+
+@inline function _is_idle_timeout_error(::Exception, ::Nothing)::Bool
+    return false
+end
+
+@inline function _is_idle_timeout_error(err::Exception, ::Float64)::Bool
+    return err isa Reseau.TCP.DeadlineExceededError ||
+           (err isa Reseau.TLS.TLSError && err.cause isa Reseau.TLS.DeadlineExceededError)
+end
+
+function _read_tcpsocket_chunk!(
+    io::TCPSocket,
+    buf::Vector{UInt8},
+    offset::Int,
+    n::Int,
+    idle_timeout::Float64,
+)::Int
+    read_ready() = begin
+        status = getfield(io, :status)
+        return bytesavailable(io) > 0 ||
+               getfield(io, :readerror) !== nothing ||
+               status == Base.StatusEOF ||
+               status == Base.StatusClosing ||
+               status == Base.StatusClosed
+    end
+
+    if !read_ready()
+        Base.start_reading(io)
+        try
+            wait_status = timedwait(read_ready, idle_timeout; pollint=min(idle_timeout / 10, 0.01))
+            wait_status === :timed_out && throw(IdleConnectionTimeoutError(idle_timeout))
+        finally
+            Base.stop_reading(io)
+        end
+    end
+
+    readerror = getfield(io, :readerror)
+    readerror !== nothing && throw(readerror)
+
+    available = bytesavailable(io)
+    if available == 0
+        return 0
+    end
+
+    bytes_to_copy = min(available, n)
+    return readbytes!(getfield(io, :buffer), view(buf, offset:(offset + bytes_to_copy - 1)), bytes_to_copy)
+end
+
+function read_exactly!(
+    io::TCPSocket,
+    buf::Vector{UInt8},
+    n::Int;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Int
     total_read = 0
     while total_read < n
-        bytes_read = readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
-        if bytes_read == 0
-            throw(EOFError())
+        bytes_read = if isnothing(idle_timeout)
+            readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
+        else
+            _read_tcpsocket_chunk!(io, buf, total_read + 1, n - total_read, idle_timeout)
         end
+        bytes_read == 0 && throw(EOFError())
         total_read += bytes_read
     end
     return total_read
 end
 
+function read_exactly!(
+    io::IO,
+    buf::Vector{UInt8},
+    n::Int;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Int
+    total_read = 0
+    while total_read < n
+        _arm_read_deadline!(io, idle_timeout)
+        try
+            bytes_read = if isnothing(idle_timeout)
+                readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
+            else
+                readbytes!(io, view(buf, (total_read + 1):n), n - total_read; all=false)
+            end
+            if bytes_read == 0
+                throw(EOFError())
+            end
+            total_read += bytes_read
+        catch err
+            if _is_idle_timeout_error(err, idle_timeout)
+                throw(IdleConnectionTimeoutError(Float64(something(idle_timeout, 0.0))))
+            end
+            rethrow()
+        finally
+            _clear_read_deadline!(io, idle_timeout)
+        end
+    end
+    return total_read
+end
+
 """
-    read_connection_preface(io::IO) -> Union{Vector{UInt8}, Nothing}
+    read_connection_preface(io::IO; idle_timeout=nothing) -> Union{Vector{UInt8}, Nothing}
 
 Read the HTTP/2 connection preface from a client.
 Returns the preface bytes, or nothing if the connection was closed.
 """
-function read_connection_preface(io::IO)::Union{Vector{UInt8}, Nothing}
+function read_connection_preface(
+    io::IO;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Union{Vector{UInt8}, Nothing}
     try
         preface = Vector{UInt8}(undef, length(CONNECTION_PREFACE))
-        n = read_exactly!(io, preface, length(CONNECTION_PREFACE))
+        n = read_exactly!(io, preface, length(CONNECTION_PREFACE); idle_timeout=idle_timeout)
         @debug "Read connection preface" n=n expected=length(CONNECTION_PREFACE) preface_hex=bytes2hex(preface[1:n]) expected_hex=bytes2hex(CONNECTION_PREFACE)
         return preface
     catch e
@@ -680,22 +1120,22 @@ function read_connection_preface(io::IO)::Union{Vector{UInt8}, Nothing}
 end
 
 """
-    read_frame(io::IO) -> Union{Frame, Nothing}
+    read_frame(io::IO; idle_timeout=nothing) -> Union{Frame, Nothing}
 
 Read an HTTP/2 frame from the connection.
 Returns the frame, or nothing if the connection was closed.
 """
-function read_frame(io::IO)::Union{Frame, Nothing}
+function read_frame(io::IO; idle_timeout::Union{Nothing, Float64}=nothing)::Union{Frame, Nothing}
     try
         # Read 9-byte frame header
         header_bytes = Vector{UInt8}(undef, FRAME_HEADER_SIZE)
-        read_exactly!(io, header_bytes, FRAME_HEADER_SIZE)
+        read_exactly!(io, header_bytes, FRAME_HEADER_SIZE; idle_timeout=idle_timeout)
         header = decode_frame_header(header_bytes)
 
         # Read payload
         payload = if header.length > 0
             buf = Vector{UInt8}(undef, header.length)
-            read_exactly!(io, buf, Int(header.length))
+            read_exactly!(io, buf, Int(header.length); idle_timeout=idle_timeout)
             buf
         else
             UInt8[]
@@ -707,6 +1147,36 @@ function read_frame(io::IO)::Union{Frame, Nothing}
             return nothing
         end
         rethrow()
+    end
+end
+
+function _read_connection_frame!(
+    server::GRPCServer,
+    io::IO,
+    keepalive::ConnectionKeepaliveState,
+)::Union{Frame, Nothing}
+    while true
+        timeout_seconds, timeout_kind = _next_connection_liveness_timeout(server, keepalive)
+        frame = try
+            read_frame(io; idle_timeout=timeout_seconds)
+        catch err
+            if err isa IdleConnectionTimeoutError
+                if timeout_kind == :keepalive_probe
+                    _start_keepalive_probe!(io, keepalive)
+                    continue
+                elseif timeout_kind == :keepalive_ack
+                    throw(KeepaliveTimeoutError(server.config.keepalive_timeout))
+                end
+            end
+            rethrow()
+        end
+
+        frame === nothing && return nothing
+
+        if _matches_keepalive_ack(keepalive, frame)
+            _clear_keepalive_probe!(keepalive)
+        end
+        return frame
     end
 end
 
@@ -731,6 +1201,254 @@ function write_frames(io::IO, frames::Vector{Frame})
         write(io, encode_frame(frame))
     end
     flush(io)
+end
+
+function _synchronize_stream_send_window!(
+    conn::HTTP2Connection,
+    stream_id::UInt32,
+    increment::Int,
+)
+    stream_id == 0 && return nothing
+    stream = get_stream(conn, stream_id)
+    stream === nothing && return nothing
+    update_send_window!(stream, increment)
+    return nothing
+end
+
+function _synchronize_initial_send_window!(
+    conn::HTTP2Connection,
+    previous_remote_initial_window_size::Int,
+)
+    delta = conn.remote_settings.initial_window_size - previous_remote_initial_window_size
+    delta == 0 && return nothing
+    lock(conn.lock) do
+        for stream in values(conn.streams)
+            update_send_window!(stream, delta)
+        end
+    end
+    return nothing
+end
+
+function _synchronize_new_stream_send_window!(
+    conn::HTTP2Connection,
+    stream_id::UInt32,
+)
+    stream = get_stream(conn, stream_id)
+    stream === nothing && return nothing
+    if !stream.headers_sent
+        stream.send_window = conn.remote_settings.initial_window_size
+    end
+    return nothing
+end
+
+function _synchronize_stream_recv_windows!(
+    conn::HTTP2Connection,
+    response_frames::Vector{Frame},
+)
+    for frame in response_frames
+        if frame.header.frame_type != FrameType.WINDOW_UPDATE ||
+           frame.header.stream_id == 0
+            continue
+        end
+        stream = get_stream(conn, frame.header.stream_id)
+        stream === nothing && continue
+        update_recv_window!(stream, Int(parse_window_update_frame(frame)))
+    end
+    return nothing
+end
+
+const MAX_INBOUND_WINDOW_UPDATE_BYTES = 32 * 1024
+
+function _inbound_window_update_threshold_ratio(conn::HTTP2Connection)::Float64
+    base_window = min(
+        conn.flow_controller.connection_window.initial_size,
+        conn.flow_controller.initial_stream_window,
+    )
+    base_window > 0 || return 0.5
+    return min(0.5, MAX_INBOUND_WINDOW_UPDATE_BYTES / base_window)
+end
+
+function _synchronize_inbound_flow_control!(
+    conn::HTTP2Connection,
+    frame::Frame,
+)::Vector{Frame}
+    if frame.header.frame_type != FrameType.DATA || frame.header.stream_id == 0
+        return Frame[]
+    end
+
+    stream_window = get_stream_window(conn.flow_controller, frame.header.stream_id)
+    stream_window === nothing && return Frame[]
+
+    payload_bytes = Int(frame.header.length)
+    if has_flag(frame.header, FrameFlags.PADDED)
+        isempty(frame.payload) && return Frame[]
+        pad_length = Int(frame.payload[1])
+        payload_bytes -= pad_length + 1
+    end
+    payload_bytes <= 0 && return Frame[]
+
+    consume!(stream_window, payload_bytes)
+    consume!(conn.flow_controller.connection_window, payload_bytes)
+    return generate_window_updates(
+        conn.flow_controller;
+        threshold_ratio=_inbound_window_update_threshold_ratio(conn),
+    )
+end
+
+function _synchronize_purehttp2_send_windows!(
+    conn::HTTP2Connection,
+    frame::Frame;
+    previous_remote_initial_window_size::Union{Nothing, Int}=nothing,
+)
+    if frame.header.frame_type == FrameType.WINDOW_UPDATE
+        increment = Int(parse_window_update_frame(frame))
+        _synchronize_stream_send_window!(conn, frame.header.stream_id, increment)
+    elseif frame.header.frame_type == FrameType.SETTINGS &&
+           !has_flag(frame.header, FrameFlags.ACK) &&
+           !isnothing(previous_remote_initial_window_size)
+        _synchronize_initial_send_window!(conn, previous_remote_initial_window_size)
+    elseif frame.header.frame_type == FrameType.HEADERS
+        _synchronize_new_stream_send_window!(conn, frame.header.stream_id)
+    end
+    return nothing
+end
+
+function _process_connection_frame!(conn::HTTP2Connection, io::IO, frame::Frame)
+    previous_remote_initial_window_size =
+        frame.header.frame_type == FrameType.SETTINGS &&
+        !has_flag(frame.header, FrameFlags.ACK) ? conn.remote_settings.initial_window_size :
+        nothing
+    response_frames = process_frame(conn, frame)
+    append!(response_frames, _synchronize_inbound_flow_control!(conn, frame))
+    _synchronize_stream_recv_windows!(conn, response_frames)
+    _synchronize_purehttp2_send_windows!(
+        conn,
+        frame;
+        previous_remote_initial_window_size=previous_remote_initial_window_size,
+    )
+    if !isempty(response_frames)
+        write_frames(io, response_frames)
+    end
+    return response_frames
+end
+
+function _await_outbound_window!(
+    conn::HTTP2Connection,
+    io::IO,
+    stream_id::UInt32;
+    required_bytes::Int=1,
+    max_frames::Int=1024,
+    context::Union{Nothing,ServerContext}=nothing,
+)::Bool
+    required_bytes > 0 || return true
+    frames_seen = 0
+    while frames_seen < max_frames
+        _throw_if_response_send_aborted!(conn, stream_id; context=context)
+        stream = get_stream(conn, stream_id)
+        if stream === nothing
+            return false
+        end
+        if max_sendable(conn.flow_controller, stream_id) >= required_bytes &&
+           stream.send_window >= required_bytes
+            @debug "Outbound window became available" stream_id frames_seen required_bytes max_sendable=max_sendable(conn.flow_controller, stream_id) send_window=stream.send_window
+            return true
+        end
+        @debug "Waiting for outbound WINDOW_UPDATE" stream_id frames_seen required_bytes max_sendable=max_sendable(conn.flow_controller, stream_id) send_window=stream.send_window
+        frame = read_frame(io)
+        frame === nothing && return false
+        @debug "Read frame while waiting for outbound window" stream_id frame_type=frame.header.frame_type frame_stream_id=frame.header.stream_id frame_length=frame.header.length
+        _process_connection_frame!(conn, io, frame)
+        frames_seen += 1
+    end
+    @debug "Outbound window wait exhausted frame budget" stream_id max_frames
+    return false
+end
+
+function _send_data_with_flow_control!(
+    conn::HTTP2Connection,
+    io::IO,
+    stream_id::UInt32,
+    data::Vector{UInt8};
+    end_stream::Bool=false,
+    context::Union{Nothing,ServerContext}=nothing,
+)
+    isempty(data) && return nothing
+    offset = 1
+    @debug "Starting flow-controlled DATA send" stream_id total_bytes=length(data) end_stream
+    while offset <= length(data)
+        _throw_if_response_send_aborted!(conn, stream_id; context=context)
+        can_send_on_stream(conn, stream_id) || throw(
+            StreamError(stream_id, ErrorCode.STREAM_CLOSED, "Cannot send DATA on closed stream"),
+        )
+        frames = send_data(conn, stream_id, data[offset:end]; end_stream=end_stream)
+        if isempty(frames)
+            @debug "DATA send blocked by flow control" stream_id offset remaining_bytes=(length(data) - offset + 1)
+            _await_outbound_window!(
+                conn,
+                io,
+                stream_id;
+                required_bytes=1,
+                context=context,
+            ) || throw(
+                StreamError(
+                    stream_id,
+                    ErrorCode.STREAM_CLOSED,
+                    "Timed out waiting for outbound HTTP/2 flow-control window",
+                ),
+            )
+            continue
+        end
+        write_frames(io, frames)
+        bytes_sent = sum(
+            Int(frame.header.length) for
+            frame in frames if frame.header.frame_type == FrameType.DATA
+        )
+        bytes_sent > 0 || throw(
+            ConnectionError(
+                ErrorCode.INTERNAL_ERROR,
+                "send_data returned no DATA bytes for a non-empty payload",
+            ),
+        )
+        @debug "Sent DATA frames" stream_id offset bytes_sent frame_count=length(frames) remaining_bytes=max(length(data) - (offset + bytes_sent) + 1, 0)
+        offset += bytes_sent
+    end
+    @debug "Completed flow-controlled DATA send" stream_id total_bytes=length(data) end_stream
+    return nothing
+end
+
+function _response_send_abort_error(
+    conn::HTTP2Connection,
+    stream_id::UInt32;
+    context::Union{Nothing,ServerContext}=nothing,
+)::Union{Nothing,Exception}
+    if !isnothing(context)
+        is_cancelled(context) &&
+            return StreamCancelledError("Request cancelled during response send")
+        remaining = remaining_time(context)
+        if !isnothing(remaining) && remaining < 0
+            return GRPCError(
+                StatusCode.DEADLINE_EXCEEDED,
+                "Request deadline exceeded during response send",
+            )
+        end
+    end
+
+    stream = get_stream(conn, stream_id)
+    if isnothing(stream) || !can_send(stream)
+        return StreamCancelledError("Stream cancelled during response send")
+    end
+
+    return nothing
+end
+
+function _throw_if_response_send_aborted!(
+    conn::HTTP2Connection,
+    stream_id::UInt32;
+    context::Union{Nothing,ServerContext}=nothing,
+)
+    error = _response_send_abort_error(conn, stream_id; context=context)
+    isnothing(error) || throw(error)
+    return nothing
 end
 
 """
@@ -763,6 +1481,47 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             continue
         end
 
+        timeout_header = get_grpc_timeout(stream)
+        deadline = timeout_header === nothing ? nothing : parse_grpc_timeout(timeout_header)
+
+        admission = _acquire_request_slot!(server; deadline=deadline)
+        if admission == :queue_full
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.RESOURCE_EXHAUSTED,
+                "Server request queue exhausted";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
+        elseif admission == :deadline_exceeded
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.DEADLINE_EXCEEDED,
+                "Request deadline exceeded while waiting for server capacity";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
+        elseif admission == :server_stopping
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.UNAVAILABLE,
+                "Server is draining and not accepting new requests";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
+        elseif admission != :acquired
+            return
+        end
+
         try
             process_stream_request!(server, conn, stream, io, peer)
 
@@ -782,6 +1541,8 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             end
             # Always remove stream on error
             remove_stream(conn, stream_id)
+        finally
+            _release_request_slot!(server)
         end
     end
 end
@@ -911,7 +1672,9 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
 
     # For client streaming, we must wait for END_STREAM before processing
     # because all client messages need to be collected first.
-    if method_desc.method_type == MethodType.CLIENT_STREAMING && !stream.end_stream_received
+    if method_desc.method_type == MethodType.CLIENT_STREAMING &&
+       !stream.end_stream_received &&
+       !method_desc.live_streaming
         @debug "Client streaming: waiting for END_STREAM" method=method_path
         return  # Don't process yet, wait for END_STREAM
     end
@@ -927,7 +1690,7 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
             return
         end
         # User-defined bidi streaming handlers need batch mode - wait for END_STREAM
-        if !stream.end_stream_received
+        if !stream.end_stream_received && !method_desc.live_streaming
             @debug "Bidi streaming: waiting for END_STREAM" method=method_path
             return  # Don't process yet, wait for END_STREAM
         end
@@ -1023,8 +1786,16 @@ function handle_server_streaming(
         send_callback = function(message, compress)
             response_data = serialize_message(message)
             grpc_message = encode_grpc_message(response_data; compressed=false)
-            data_frames = send_data(conn, stream.id, grpc_message; end_stream=false)
-            write_frames(io, data_frames)
+            @debug "Server streaming emitting message" stream_id=stream.id payload_bytes=length(response_data) grpc_bytes=length(grpc_message) compress
+            _send_data_with_flow_control!(
+                conn,
+                io,
+                stream.id,
+                grpc_message;
+                end_stream=false,
+                context=ctx,
+            )
+            @debug "Server streaming message flushed" stream_id=stream.id grpc_bytes=length(grpc_message)
         end
 
         # Create close callback (no-op for server streaming, trailers sent after)
@@ -1045,17 +1816,30 @@ function handle_server_streaming(
         handler = build_handler_chain(server.dispatcher, service.name, method_desc.handler, info)
 
         # Call handler with request and stream
+        @debug "Invoking server streaming handler" stream_id=stream.id method=method_desc.name
         handler(ctx, request, stream_obj)
+        @debug "Server streaming handler returned" stream_id=stream.id method=method_desc.name
 
     catch e
         if e isa GRPCError
             final_status = e.code
             final_message = e.message
+        elseif (
+            e isa StreamError ||
+            e isa EOFError ||
+            e isa Base.IOError ||
+            e isa InterruptException
+        ) && server.status != ServerStatus.RUNNING
+            return nothing
         else
             @error "Error in server streaming handler" exception=(e, catch_backtrace())
             final_status = StatusCode.INTERNAL
             final_message = server.dispatcher.debug_mode ? sprint(showerror, e) : "Internal server error"
         end
+    end
+
+    if !_serving_inflight_requests(server) || !Base.isopen(io) || !can_send(stream)
+        return nothing
     end
 
     # Send trailers with final status
@@ -1065,8 +1849,10 @@ function handle_server_streaming(
     if !isempty(final_message)
         push!(trailers, ("grpc-message", final_message))
     end
+    @debug "Sending server streaming trailers" stream_id=stream.id status=final_status message=final_message
     trailer_frames = send_trailers(conn, stream.id, trailers)
     write_frames(io, trailer_frames)
+    @debug "Server streaming trailers flushed" stream_id=stream.id frame_count=length(trailer_frames)
 end
 
 """
@@ -1077,10 +1863,7 @@ Returns true if message available, false if stream ended.
 Uses polling with yield() to allow other tasks to run.
 """
 function wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io::IO)::Bool
-    max_iterations = 10000  # Safety limit
-    iteration = 0
-
-    while iteration < max_iterations
+    while true
         # Check if we have a complete message
         if has_complete_grpc_message(stream)
             return true
@@ -1098,29 +1881,48 @@ function wait_for_message_or_end(stream::HTTP2Stream, conn::HTTP2Connection, io:
         end
 
         # Process any pending frames from the connection
-        # This reads more data if available
         try
-            if eof(io)
-                return false
-            end
-            # Try to read and process any waiting frames
-            frame = try_read_frame(io, conn)
-            if frame !== nothing
-                process_frame!(conn, frame)
-            end
+            frame = read_frame(io)
+            frame === nothing && return false
+            _process_connection_frame!(conn, io, frame)
         catch e
-            if !(e isa EOFError)
+            if !(e isa EOFError || e isa Base.IOError)
                 @debug "Error reading frame while waiting for message" exception=e
             end
             return false
         end
-
-        iteration += 1
-        yield()  # Allow other tasks to run
     end
+end
 
-    @warn "Exceeded max iterations waiting for message" stream_id=stream.id
-    return false
+function _live_streaming_receive_callback(
+    stream::HTTP2Stream,
+    conn::HTTP2Connection,
+    io::IO,
+    method_desc::MethodDescriptor,
+    first_message::Vector{UInt8},
+)
+    pending_message = Ref{Union{Nothing,Vector{UInt8}}}(
+        isempty(first_message) ? nothing : first_message,
+    )
+    return function()
+        while true
+            message_data = pending_message[]
+            if !isnothing(message_data)
+                pending_message[] = nothing
+                @debug "Live streaming received buffered message" stream_id=stream.id bytes=length(message_data)
+                return deserialize_message(message_data, method_desc.input_type)
+            end
+
+            message_data = read_grpc_message!(stream)
+            if message_data !== nothing
+                @debug "Live streaming received message" stream_id=stream.id bytes=length(message_data)
+                return deserialize_message(message_data, method_desc.input_type)
+            end
+
+            @debug "Live streaming waiting for more request data" stream_id=stream.id end_stream=stream.end_stream_received buffered_bytes=length(peek_data(stream))
+            wait_for_message_or_end(stream, conn, io) || return nothing
+        end
+    end
 end
 
 """
@@ -1179,37 +1981,33 @@ function handle_client_streaming(
     response_data = UInt8[]
 
     try
-        # Collect all messages from buffer
-        # The first message was already read by process_stream_request!
-        # Remaining messages are still in the stream buffer
-        messages = Vector{UInt8}[]
+        receive_callback = if method_desc.live_streaming
+            _live_streaming_receive_callback(stream, conn, io, method_desc, first_message)
+        else
+            messages = Vector{UInt8}[]
 
-        # Add first message if not empty
-        if !isempty(first_message)
-            push!(messages, first_message)
-        end
-
-        # Read all remaining messages from buffer
-        # Since end_stream_received is true, all data is already buffered
-        while has_complete_grpc_message(stream)
-            msg = read_grpc_message!(stream)
-            if msg !== nothing
-                push!(messages, msg)
+            if !isempty(first_message)
+                push!(messages, first_message)
             end
-        end
 
-        @debug "Client streaming collected messages" count=length(messages) stream_id=stream.id
-
-        # Create receive callback that yields collected messages
-        message_index = Ref(1)
-        receive_callback = function()
-            if message_index[] > length(messages)
-                return nothing
+            while has_complete_grpc_message(stream)
+                msg = read_grpc_message!(stream)
+                if msg !== nothing
+                    push!(messages, msg)
+                end
             end
-            msg_data = messages[message_index[]]
-            message_index[] += 1
-            # Deserialize message
-            return deserialize_message(msg_data, method_desc.input_type)
+
+            @debug "Client streaming collected messages" count=length(messages) stream_id=stream.id
+
+            message_index = Ref(1)
+            function ()
+                if message_index[] > length(messages)
+                    return nothing
+                end
+                msg_data = messages[message_index[]]
+                message_index[] += 1
+                return deserialize_message(msg_data, method_desc.input_type)
+            end
         end
 
         # Create is_cancelled callback
@@ -1304,8 +2102,14 @@ function handle_bidi_streaming_incremental(
         # Send response data
         if !isempty(response_data)
             grpc_message = encode_grpc_message(response_data; compressed=false)
-            data_frames = send_data(conn, stream.id, grpc_message; end_stream=false)
-            write_frames(io, data_frames)
+            _send_data_with_flow_control!(
+                conn,
+                io,
+                stream.id,
+                grpc_message;
+                end_stream=false,
+                context=ctx,
+            )
         end
     end
 
@@ -1362,31 +2166,32 @@ function handle_bidi_streaming(
     trailers_sent = Ref(false)
 
     try
-        # Collect all messages from buffer (since we wait for END_STREAM)
-        messages = Vector{UInt8}[]
-        if !isempty(first_message)
-            push!(messages, first_message)
-        end
-
-        # Read all remaining messages from buffer
-        while has_complete_grpc_message(stream)
-            msg = read_grpc_message!(stream)
-            if msg !== nothing
-                push!(messages, msg)
+        receive_callback = if method_desc.live_streaming
+            _live_streaming_receive_callback(stream, conn, io, method_desc, first_message)
+        else
+            messages = Vector{UInt8}[]
+            if !isempty(first_message)
+                push!(messages, first_message)
             end
-        end
 
-        @debug "Bidi streaming collected messages" count=length(messages) stream_id=stream.id
-
-        # Create receive callback that yields collected messages
-        message_index = Ref(1)
-        receive_callback = function()
-            if message_index[] > length(messages)
-                return nothing
+            while has_complete_grpc_message(stream)
+                msg = read_grpc_message!(stream)
+                if msg !== nothing
+                    push!(messages, msg)
+                end
             end
-            msg_data = messages[message_index[]]
-            message_index[] += 1
-            return deserialize_message(msg_data, method_desc.input_type)
+
+            @debug "Bidi streaming collected messages" count=length(messages) stream_id=stream.id
+
+            message_index = Ref(1)
+            function ()
+                if message_index[] > length(messages)
+                    return nothing
+                end
+                msg_data = messages[message_index[]]
+                message_index[] += 1
+                return deserialize_message(msg_data, method_desc.input_type)
+            end
         end
 
         # Create send callback for responses
@@ -1397,8 +2202,14 @@ function handle_bidi_streaming(
             end
             response_data = serialize_message(message)
             grpc_message = encode_grpc_message(response_data; compressed=false)
-            data_frames = send_data(conn, stream.id, grpc_message; end_stream=false)
-            write_frames(io, data_frames)
+            _send_data_with_flow_control!(
+                conn,
+                io,
+                stream.id,
+                grpc_message;
+                end_stream=false,
+                context=ctx,
+            )
         end
 
         # Create close callback that sends trailers
@@ -1872,8 +2683,13 @@ function send_grpc_response(conn::HTTP2Connection, io::IO, stream_id::UInt32,
     # Send response data (with gRPC framing)
     if !isempty(data)
         grpc_message = encode_grpc_message(data)
-        data_frames = send_data(conn, stream_id, grpc_message; end_stream=false)
-        write_frames(io, data_frames)
+        _send_data_with_flow_control!(
+            conn,
+            io,
+            stream_id,
+            grpc_message;
+            end_stream=false,
+        )
     end
 
     # Send trailers with status
@@ -1954,14 +2770,14 @@ function Base.show(io::IO, server::GRPCServer)
     print(io, "GRPCServer($(server.host):$(server.port), status=$(server.status)")
     print(io, ", services=$(length(services(server)))")
     if server.config.tls !== nothing
-        tls_status = server.ssl_context !== nothing ? "active" : "configured"
+        tls_status = server.tls_transport !== nothing ? "active" : "configured"
         print(io, ", TLS=$tls_status")
     end
     print(io, ")")
 end
 
 function Base.isopen(server::GRPCServer)::Bool
-    return server.status in (ServerStatus.RUNNING, ServerStatus.DRAINING)
+    return _serving_inflight_requests(server)
 end
 
 """

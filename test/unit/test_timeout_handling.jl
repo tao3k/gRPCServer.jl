@@ -3,6 +3,7 @@
 
 using Test
 using Dates
+using Sockets
 using gRPCServer
 
 # Include conformance test data

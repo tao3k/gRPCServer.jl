@@ -20,6 +20,7 @@ using .TestUtils
     include("unit/test_health.jl")
     include("unit/test_server.jl")
     include("unit/test_tls.jl")
+    include("unit/test_tls_docs.jl")
     include("unit/test_reflection.jl")
     include("unit/test_hpack.jl")
     include("unit/test_http2_stream.jl")
@@ -34,6 +35,7 @@ using .TestUtils
     include("unit/test_error_mapping.jl")
     include("unit/test_connection_management.jl")
     include("unit/test_timeout_handling.jl")
+    include("unit/test_http2_backend.jl")
 
     # Integration tests
     include("integration/test_unary.jl")
@@ -45,6 +47,10 @@ using .TestUtils
     include("integration/test_interceptors.jl")
     include("integration/test_health.jl")
     include("integration/test_tls.jl")
+    include("integration/test_tls_interop.jl")
+
+    # gRPCClient integration tests
+    include("integration/test_grpcclient.jl")
 
     # Contract tests
     include("contract/test_grpcurl.jl")

@@ -61,3 +61,34 @@ Use these as a reference when evaluating performance changes.
 cd benchmark
 julia --project benchmarks.jl --save baseline.json
 ```
+
+## Production-Like Live HTTP/2 Soak
+
+For transport-oriented concurrency and teardown validation on reused live HTTP/2
+sessions, run the dedicated soak runner instead of the microbenchmark suite:
+
+```bash
+julia --project=benchmark benchmark/live_unary_soak.jl \
+  --concurrency 16 \
+  --requests-per-session 32 \
+  --max-concurrent-requests 16 \
+  --max-queued-requests 64
+```
+
+The soak runner reports aggregate throughput, latency percentiles, graceful
+stop latency, and whether connection and admission state drained cleanly after
+shutdown.
+
+For repeated pressure sweeps such as `16/32/64` concurrency on a fixed Julia
+thread count, use the sweep harness:
+
+```bash
+JULIA_NUM_THREADS=8 julia --project=benchmark benchmark/live_unary_sweep.jl \
+  --concurrency-list 16,32,64 \
+  --rounds 3 \
+  --requests-per-session 32
+```
+
+The sweep runner prints per-round measurements and a final Markdown summary
+table with throughput, latency, and graceful-stop statistics for each
+concurrency level.

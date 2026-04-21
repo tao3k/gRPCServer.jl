@@ -35,7 +35,12 @@ using ProtoBuf
 using CodecZlib
 using TranscodingStreams
 using PrecompileTools
-using OpenSSL
+using Reseau
+using PureHTTP2
+
+# Import functions from PureHTTP2 that gRPCServer also defines methods for,
+# so the method tables merge (allows dispatch on both PureHTTP2 and gRPCServer types).
+import PureHTTP2: get_metadata, set_header!, is_closed
 
 # Include source files in dependency order
 
@@ -48,12 +53,8 @@ include("compression.jl")
 # 3. Configuration (depends on compression for CompressionCodec)
 include("config.jl")
 
-# 4. HTTP/2 implementation (internal dependencies handled by include order)
-include("http2/frames.jl")
-include("http2/hpack.jl")
-include("http2/stream.jl")
-include("http2/flow_control.jl")
-include("http2/connection.jl")
+# 4. HTTP/2 backend abstraction (delegates to PureHTTP2.jl)
+include("http2_backend.jl")
 
 # 5. Context and streams (depend on config, errors)
 include("context.jl")
@@ -72,12 +73,13 @@ include("proto/grpc/reflection/v1alpha/reflection_pb.jl")
 # 8b. Proto descriptors (compiled .pb files for reflection service)
 include("proto/descriptors.jl")
 
-# 9. Main server (depends on everything above including proto types)
+# 8c. TLS transport (must come before server.jl — GRPCServer holds a TLSTransport)
+include("tls/transport.jl")
+
+# 9. Main server (depends on everything above including proto types and TLSTransport)
 include("server.jl")
 
-# 10. TLS implementation (optional, depends on server, config)
-include("tls/config.jl")
-include("tls/alpn.jl")
+# 10. TLS certificate reload (depends on server for watcher wiring)
 include("tls/reload.jl")
 
 # 11. Built-in services (depend on server, dispatch)
@@ -133,6 +135,9 @@ export compress, decompress, codec_name, parse_codec, negotiate_compression
 # Proto Descriptors (for reflection service)
 export HEALTH_DESCRIPTOR, REFLECTION_DESCRIPTOR
 export has_health_descriptor, has_reflection_descriptor
+
+# HTTP/2 Backend Abstraction
+export AbstractHTTP2Backend, PureHTTP2Backend, create_connection
 
 # HTTP/2 Stream State (for advanced use cases)
 export can_send, StreamError

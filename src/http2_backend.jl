@@ -26,7 +26,24 @@ This backend delegates all HTTP/2 operations to the PureHTTP2 package,
 which provides a pure-Julia implementation of the HTTP/2 protocol (RFC 7540)
 including HPACK header compression (RFC 7541), stream management, and flow control.
 """
-struct PureHTTP2Backend <: AbstractHTTP2Backend end
+const DEFAULT_PUREHTTP2_INITIAL_WINDOW_SIZE = 1 * 1024 * 1024
+
+struct PureHTTP2Backend <: AbstractHTTP2Backend
+    local_settings::PureHTTP2.ConnectionSettings
+
+    function PureHTTP2Backend(;
+        initial_window_size::Integer=DEFAULT_PUREHTTP2_INITIAL_WINDOW_SIZE,
+    )
+        initial_window_size > 0 || throw(
+            ArgumentError("initial_window_size must be positive"),
+        )
+        local_settings = PureHTTP2.ConnectionSettings()
+        local_settings.initial_window_size = Int(initial_window_size)
+        return new(
+            local_settings,
+        )
+    end
+end
 
 """
     create_connection(backend::AbstractHTTP2Backend)
@@ -45,4 +62,5 @@ conn = create_connection(backend)  # Returns a PureHTTP2.HTTP2Connection
 """
 function create_connection end
 
-create_connection(::PureHTTP2Backend) = PureHTTP2.HTTP2Connection()
+create_connection(backend::PureHTTP2Backend) =
+    PureHTTP2.HTTP2Connection(local_settings=backend.local_settings)

@@ -183,6 +183,78 @@ using .ConformanceData
             @test frame.header.length == 4
         end
 
+        @testset "WINDOW_UPDATE synchronizes stream send window" begin
+            conn = PureHTTP2.HTTP2Connection()
+            conn.state = PureHTTP2.ConnectionState.OPEN
+            stream = PureHTTP2.create_stream(conn, UInt32(1))
+            PureHTTP2.receive_headers!(stream, false)
+            PureHTTP2.send_data!(stream, 65530, false)
+
+            frame = PureHTTP2.window_update_frame(1, 32)
+            response_frames = PureHTTP2.process_frame(conn, frame)
+            @test isempty(response_frames)
+
+            gRPCServer._synchronize_purehttp2_send_windows!(conn, frame)
+            @test stream.send_window == 37
+        end
+
+        @testset "New streams adopt remote initial send window" begin
+            conn = PureHTTP2.HTTP2Connection()
+            conn.state = PureHTTP2.ConnectionState.OPEN
+
+            previous_remote_initial_window_size = conn.remote_settings.initial_window_size
+            settings = PureHTTP2.settings_frame([
+                (
+                    UInt16(PureHTTP2.SettingsParameter.INITIAL_WINDOW_SIZE),
+                    UInt32(131072),
+                ),
+            ])
+            response_frames = PureHTTP2.process_frame(conn, settings)
+            @test length(response_frames) == 1
+
+            gRPCServer._synchronize_purehttp2_send_windows!(
+                conn,
+                settings;
+                previous_remote_initial_window_size=previous_remote_initial_window_size,
+            )
+
+            request_headers = [
+                (":method", "POST"),
+                (":scheme", "http"),
+                (":path", "/test.StreamService/Stream"),
+                (":authority", "127.0.0.1"),
+                ("content-type", "application/grpc"),
+            ]
+            header_block = PureHTTP2.encode_headers(conn.hpack_encoder, request_headers)
+            headers = PureHTTP2.headers_frame(1, header_block; end_stream=true)
+            response_frames = PureHTTP2.process_frame(conn, headers)
+            @test isempty(response_frames)
+
+            gRPCServer._synchronize_purehttp2_send_windows!(conn, headers)
+            stream = PureHTTP2.get_stream(conn, UInt32(1))
+            @test stream !== nothing
+            @test stream.send_window == 131072
+        end
+
+        @testset "Generated WINDOW_UPDATE synchronizes stream recv window" begin
+            conn = PureHTTP2.HTTP2Connection()
+            conn.state = PureHTTP2.ConnectionState.OPEN
+            stream = PureHTTP2.create_stream(conn, UInt32(1))
+            PureHTTP2.receive_headers!(stream, false)
+
+            initial_window = stream.recv_window
+            frame = PureHTTP2.data_frame(1, fill(UInt8('x'), 40000))
+            io = IOBuffer()
+            response_frames = gRPCServer._process_connection_frame!(conn, io, frame)
+
+            @test any(
+                resp.header.frame_type == PureHTTP2.FrameType.WINDOW_UPDATE &&
+                resp.header.stream_id == 1 for resp in response_frames
+            )
+
+            @test stream.recv_window == initial_window
+        end
+
     end  # T040
 
     # =========================================================================

@@ -39,6 +39,7 @@ struct MethodDescriptor
     handler::Function
     input_julia_type::Union{Type, Nothing}
     output_julia_type::Union{Type, Nothing}
+    live_streaming::Bool
 
     # Constructor with string type names (backward compatible)
     function MethodDescriptor(
@@ -46,9 +47,19 @@ struct MethodDescriptor
         method_type::MethodType.T,
         input_type::String,
         output_type::String,
-        handler::Function
+        handler::Function;
+        live_streaming::Bool=false,
     )
-        new(name, method_type, input_type, output_type, handler, nothing, nothing)
+        new(
+            name,
+            method_type,
+            input_type,
+            output_type,
+            handler,
+            nothing,
+            nothing,
+            live_streaming,
+        )
     end
 
     # Constructor with Julia types (preferred - enables auto-registration)
@@ -57,12 +68,22 @@ struct MethodDescriptor
         method_type::MethodType.T,
         input_type::Type,
         output_type::Type,
-        handler::Function
+        handler::Function;
+        live_streaming::Bool=false,
     )
         # Derive protobuf type name from Julia type
         input_name = _type_to_proto_name(input_type)
         output_name = _type_to_proto_name(output_type)
-        new(name, method_type, input_name, output_name, handler, input_type, output_type)
+        new(
+            name,
+            method_type,
+            input_name,
+            output_name,
+            handler,
+            input_type,
+            output_type,
+            live_streaming,
+        )
     end
 end
 

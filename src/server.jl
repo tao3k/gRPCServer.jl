@@ -953,13 +953,14 @@ function _await_outbound_window!(
     stream_id::UInt32;
     required_bytes::Int=1,
     max_frames::Int=1024,
+    context::Union{Nothing,ServerContext}=nothing,
 )::Bool
     required_bytes > 0 || return true
     frames_seen = 0
     while frames_seen < max_frames
+        _throw_if_response_send_aborted!(conn, stream_id; context=context)
         stream = get_stream(conn, stream_id)
-        if stream === nothing || !can_send(stream)
-            @debug "Outbound window wait aborted because stream is no longer sendable" stream_id frames_seen
+        if stream === nothing
             return false
         end
         if max_sendable(conn.flow_controller, stream_id) >= required_bytes &&
@@ -984,11 +985,13 @@ function _send_data_with_flow_control!(
     stream_id::UInt32,
     data::Vector{UInt8};
     end_stream::Bool=false,
+    context::Union{Nothing,ServerContext}=nothing,
 )
     isempty(data) && return nothing
     offset = 1
     @debug "Starting flow-controlled DATA send" stream_id total_bytes=length(data) end_stream
     while offset <= length(data)
+        _throw_if_response_send_aborted!(conn, stream_id; context=context)
         can_send_on_stream(conn, stream_id) || throw(
             StreamError(stream_id, ErrorCode.STREAM_CLOSED, "Cannot send DATA on closed stream"),
         )
@@ -1000,6 +1003,7 @@ function _send_data_with_flow_control!(
                 io,
                 stream_id;
                 required_bytes=1,
+                context=context,
             ) || throw(
                 StreamError(
                     stream_id,
@@ -1024,6 +1028,41 @@ function _send_data_with_flow_control!(
         offset += bytes_sent
     end
     @debug "Completed flow-controlled DATA send" stream_id total_bytes=length(data) end_stream
+    return nothing
+end
+
+function _response_send_abort_error(
+    conn::HTTP2Connection,
+    stream_id::UInt32;
+    context::Union{Nothing,ServerContext}=nothing,
+)::Union{Nothing,Exception}
+    if !isnothing(context)
+        is_cancelled(context) &&
+            return StreamCancelledError("Request cancelled during response send")
+        remaining = remaining_time(context)
+        if !isnothing(remaining) && remaining < 0
+            return GRPCError(
+                StatusCode.DEADLINE_EXCEEDED,
+                "Request deadline exceeded during response send",
+            )
+        end
+    end
+
+    stream = get_stream(conn, stream_id)
+    if isnothing(stream) || !can_send(stream)
+        return StreamCancelledError("Stream cancelled during response send")
+    end
+
+    return nothing
+end
+
+function _throw_if_response_send_aborted!(
+    conn::HTTP2Connection,
+    stream_id::UInt32;
+    context::Union{Nothing,ServerContext}=nothing,
+)
+    error = _response_send_abort_error(conn, stream_id; context=context)
+    isnothing(error) || throw(error)
     return nothing
 end
 
@@ -1326,6 +1365,7 @@ function handle_server_streaming(
                 stream.id,
                 grpc_message;
                 end_stream=false,
+                context=ctx,
             )
             @debug "Server streaming message flushed" stream_id=stream.id grpc_bytes=length(grpc_message)
         end
@@ -1640,6 +1680,7 @@ function handle_bidi_streaming_incremental(
                 stream.id,
                 grpc_message;
                 end_stream=false,
+                context=ctx,
             )
         end
     end
@@ -1739,6 +1780,7 @@ function handle_bidi_streaming(
                 stream.id,
                 grpc_message;
                 end_stream=false,
+                context=ctx,
             )
         end
 

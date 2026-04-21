@@ -1,6 +1,7 @@
 # Unit tests for GRPCServer lifecycle
 
 using Test
+using Dates
 using gRPCServer
 using PureHTTP2
 using Sockets
@@ -99,6 +100,73 @@ end
                 frame.header.stream_id == stream.id,
             updates,
         )
+    end
+
+    @testset "Response send abort enforcement" begin
+        backend = PureHTTP2Backend()
+        conn = create_connection(backend)
+        stream = PureHTTP2.create_stream(conn, UInt32(7))
+
+        expired_ctx = ServerContext(deadline=now() - Millisecond(10))
+        deadline_error = gRPCServer._response_send_abort_error(conn, stream.id; context=expired_ctx)
+        @test deadline_error isa GRPCError
+        @test deadline_error.code == StatusCode.DEADLINE_EXCEEDED
+
+        cancelled_ctx = ServerContext()
+        gRPCServer.cancel!(cancelled_ctx)
+        cancelled_error = gRPCServer._response_send_abort_error(conn, stream.id; context=cancelled_ctx)
+        @test cancelled_error isa StreamCancelledError
+
+        stream.state = PureHTTP2.StreamState.CLOSED
+        closed_error = gRPCServer._response_send_abort_error(conn, stream.id)
+        @test closed_error isa StreamCancelledError
+
+        open_stream = PureHTTP2.create_stream(conn, UInt32(9))
+        open_stream.state = PureHTTP2.StreamState.OPEN
+        active_ctx = ServerContext(deadline=now() + Second(1))
+        @test isnothing(
+            gRPCServer._response_send_abort_error(conn, open_stream.id; context=active_ctx),
+        )
+    end
+
+    @testset "_send_data_with_flow_control! aborts before write when request is inactive" begin
+        backend = PureHTTP2Backend()
+        conn = create_connection(backend)
+        stream = PureHTTP2.create_stream(conn, UInt32(11))
+        io = IOBuffer()
+        payload = UInt8[0x01, 0x02, 0x03]
+
+        expired_ctx = ServerContext(deadline=now() - Millisecond(10))
+        deadline_error = try
+            gRPCServer._send_data_with_flow_control!(
+                conn,
+                io,
+                stream.id,
+                payload;
+                context=expired_ctx,
+            )
+            nothing
+        catch err
+            err
+        end
+        @test deadline_error isa GRPCError
+        @test deadline_error.code == StatusCode.DEADLINE_EXCEEDED
+
+        cancelled_ctx = ServerContext()
+        gRPCServer.cancel!(cancelled_ctx)
+        cancelled_error = try
+            gRPCServer._send_data_with_flow_control!(
+                conn,
+                io,
+                stream.id,
+                payload;
+                context=cancelled_ctx,
+            )
+            nothing
+        catch err
+            err
+        end
+        @test cancelled_error isa StreamCancelledError
     end
 
     @testset "Server Status" begin

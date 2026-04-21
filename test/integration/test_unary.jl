@@ -3,10 +3,38 @@
 
 using Test
 using gRPCServer
+using PureHTTP2
 using Sockets
 
 # TestUtils is included once in runtests.jl to avoid method redefinition warnings
 # using TestUtils is inherited from the parent module
+
+function run_live_unary_request(port::Int, path::String, payload::Vector{UInt8})
+    tcp = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
+    conn = PureHTTP2.HTTP2Connection()
+    try
+        result = PureHTTP2.open_connection!(
+            conn,
+            tcp;
+            request_headers=[
+                (":method", "POST"),
+                (":path", path),
+                (":scheme", "http"),
+                (":authority", "127.0.0.1:$port"),
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+            ],
+            request_body=build_grpc_message(payload),
+        )
+
+        collector = TestUtils.MockResponseCollector()
+        TestUtils.parse_response_headers!(collector, result.headers)
+        collector.data = result.body
+        return (; result, collector)
+    finally
+        close(tcp)
+    end
+end
 
 @testset "Unary RPC Integration Tests" begin
     @testset "Basic Connection" begin
@@ -217,6 +245,58 @@ using Sockets
             connect!(client)
             @test ts.server.status == ServerStatus.RUNNING
             disconnect!(client)
+        end
+    end
+
+    @testset "Live Unary Request Admission Saturation" begin
+        descriptor = ServiceDescriptor(
+            "test.SaturationService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.3)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(max_concurrent_requests=1, max_queued_requests=1) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.SaturationService"] = HealthStatus.SERVING
+
+            request_path = "/test.SaturationService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x01, 0x02])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            second = @async run_live_unary_request(ts.port, request_path, UInt8[0x03, 0x04])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).queued_requests == 1,
+                1.0,
+            ) === :ok
+            @test !istaskdone(second)
+
+            third = @async run_live_unary_request(ts.port, request_path, UInt8[0x05, 0x06])
+            third_result = fetch(third)
+            @test third_result.collector.grpc_status == Int(StatusCode.RESOURCE_EXHAUSTED)
+            @test third_result.collector.grpc_message !== nothing
+            @test occursin("queue", lowercase(third_result.collector.grpc_message))
+
+            first_result = fetch(first)
+            second_result = fetch(second)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+            @test second_result.collector.grpc_status == Int(StatusCode.OK)
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+            @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
         end
     end
 end

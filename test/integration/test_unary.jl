@@ -439,6 +439,24 @@ end
         end
     end
 
+    @testset "Graceful Stop Does Not Wait On Idle Connection" begin
+        with_test_server() do ts
+            blocker = MockGRPCClient("127.0.0.1", ts.port)
+            @test connect!(blocker)
+            @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+            stopper = @async stop!(ts.server; force=false, timeout=1.0)
+            @test timedwait(() -> ts.server.status != ServerStatus.RUNNING, 1.0) === :ok
+            @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+
+            wait(stopper)
+            @test ts.server.status == ServerStatus.STOPPED
+            @test isempty(ts.server.connections)
+
+            disconnect!(blocker)
+        end
+    end
+
     @testset "Live Unary Admission Deadline While Queued" begin
         descriptor = ServiceDescriptor(
             "test.DeadlineQueueService",

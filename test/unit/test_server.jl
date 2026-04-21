@@ -279,7 +279,7 @@ end
         end
     end
 
-    @testset "Blocking run waits through graceful drain" begin
+    @testset "Graceful drain does not wait for idle connections" begin
         server = GRPCServer("127.0.0.1", test_available_port(); drain_timeout=1.0)
         client = nothing
         runner = nothing
@@ -292,19 +292,16 @@ end
             @test timedwait(() -> length(server.connections) == 1, 2.0) === :ok
 
             stopper = @async stop!(server; force=false, timeout=1.0)
-            @test timedwait(() -> server.status == ServerStatus.DRAINING, 2.0) === :ok
-            @test timedwait(() -> istaskdone(runner), 0.2) === :timed_out
-            @test timedwait(() -> istaskdone(stopper), 0.2) === :timed_out
-
-            close(client)
-            client = nothing
-            @test timedwait(() -> isempty(server.connections), 2.0) === :ok
+            @test timedwait(() -> server.status != ServerStatus.RUNNING, 2.0) === :ok
+            @test timedwait(() -> istaskdone(stopper), 1.0) === :ok
+            @test timedwait(() -> istaskdone(runner), 1.0) === :ok
 
             wait(stopper)
             wait(runner)
 
             @test server.status == ServerStatus.STOPPED
             @test isnothing(server.accept_task)
+            @test isempty(server.connections)
             @test isempty(server.connection_tasks)
             @test !Base.isopen(server)
         finally

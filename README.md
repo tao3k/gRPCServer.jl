@@ -34,7 +34,8 @@ are closed at the server boundary, and requests beyond the active plus queued
 budget are rejected with `RESOURCE_EXHAUSTED`. Queued requests also honor the
 incoming `grpc-timeout` deadline while waiting for server capacity. A graceful
 `stop!(server; force=false)` closes the listener, keeps admitted requests alive
-through drain, and refuses new work while the server is draining, including new
+through drain, closes remaining idle connections once in-flight requests are
+finished, and refuses new work while the server is draining, including new
 streams opened on existing HTTP/2 connections.
 
 ## Related Packages

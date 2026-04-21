@@ -294,6 +294,12 @@ function _request_admission_state(server::GRPCServer)
     end
 end
 
+function _request_admission_drained(server::GRPCServer)::Bool
+    lock(server.request_admission) do
+        return server.active_requests == 0 && server.queued_requests == 0
+    end
+end
+
 function _notify_request_admission_waiters!(server::GRPCServer)
     lock(server.request_admission) do
         notify(server.request_admission; all=true)
@@ -569,9 +575,14 @@ function stop!(server::GRPCServer; force::Bool=false, timeout::Float64=0.0)
         # Wait for in-flight requests
         drain_time = timeout > 0 ? timeout : server.config.drain_timeout
         drain_deadline = time() + drain_time
-
-        while !isempty(server.connections) && time() < drain_deadline
-            sleep(0.1)
+        wait_status = timedwait(
+            () -> _request_admission_drained(server),
+            drain_time;
+            pollint=0.05,
+        )
+        if wait_status != :ok
+            state = _request_admission_state(server)
+            @warn "Timed out waiting for in-flight requests during graceful shutdown" timeout=drain_time active_requests=state.active_requests queued_requests=state.queued_requests
         end
 
         # Force close remaining connections

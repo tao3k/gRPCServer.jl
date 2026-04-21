@@ -83,5 +83,35 @@ function create_dispatch_benchmarks()
         PeerInfo(IPv4("127.0.0.1"), 12345)
     end
 
+    # Benchmark: Unbounded request admission (default production path)
+    server_unbounded = GRPCServer("127.0.0.1", 50051)
+    server_unbounded.status = ServerStatus.RUNNING
+
+    suite["request_admission_unbounded"] = @benchmarkable begin
+        status = gRPCServer._acquire_request_slot!($server_unbounded)
+        status == :acquired || error("unexpected admission status: $status")
+        gRPCServer._release_request_slot!($server_unbounded)
+    end
+
+    # Benchmark: Bounded request admission without contention
+    server_bounded = GRPCServer(
+        "127.0.0.1",
+        50052;
+        max_concurrent_requests=8,
+        max_queued_requests=32,
+    )
+    server_bounded.status = ServerStatus.RUNNING
+
+    suite["request_admission_bounded"] = @benchmarkable begin
+        status = gRPCServer._acquire_request_slot!($server_bounded)
+        status == :acquired || error("unexpected admission status: $status")
+        gRPCServer._release_request_slot!($server_bounded)
+    end
+
+    # Benchmark: Admission state snapshot for drain/monitoring checks
+    suite["request_admission_state"] = @benchmarkable begin
+        gRPCServer._request_admission_state($server_bounded)
+    end
+
     return suite
 end

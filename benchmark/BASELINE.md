@@ -61,3 +61,20 @@ Use these as a reference when evaluating performance changes.
 cd benchmark
 julia --project benchmarks.jl --save baseline.json
 ```
+
+## Production-Like Live HTTP/2 Soak
+
+For transport-oriented concurrency and teardown validation on reused live HTTP/2
+sessions, run the dedicated soak runner instead of the microbenchmark suite:
+
+```bash
+julia --project=benchmark benchmark/live_unary_soak.jl \
+  --concurrency 16 \
+  --requests-per-session 32 \
+  --max-concurrent-requests 16 \
+  --max-queued-requests 64
+```
+
+The soak runner reports aggregate throughput, latency percentiles, graceful
+stop latency, and whether connection and admission state drained cleanly after
+shutdown.

@@ -278,4 +278,63 @@ end
             end
         end
     end
+
+    @testset "Blocking run waits through graceful drain" begin
+        server = GRPCServer("127.0.0.1", test_available_port(); drain_timeout=1.0)
+        client = nothing
+        runner = nothing
+        stopper = nothing
+        try
+            runner = @async run(server)
+            @test timedwait(() -> server.status == ServerStatus.RUNNING, 2.0) === :ok
+
+            client = connect(IPv4("127.0.0.1"), server.port)
+            @test timedwait(() -> length(server.connections) == 1, 2.0) === :ok
+
+            stopper = @async stop!(server; force=false, timeout=1.0)
+            @test timedwait(() -> server.status == ServerStatus.DRAINING, 2.0) === :ok
+            @test timedwait(() -> istaskdone(runner), 0.2) === :timed_out
+            @test timedwait(() -> istaskdone(stopper), 0.2) === :timed_out
+
+            close(client)
+            client = nothing
+            @test timedwait(() -> isempty(server.connections), 2.0) === :ok
+
+            wait(stopper)
+            wait(runner)
+
+            @test server.status == ServerStatus.STOPPED
+            @test isnothing(server.accept_task)
+            @test isempty(server.connection_tasks)
+            @test !Base.isopen(server)
+        finally
+            if client !== nothing
+                try
+                    close(client)
+                catch
+                end
+            end
+            if stopper !== nothing && !istaskdone(stopper)
+                try
+                    wait(stopper)
+                catch
+                end
+            end
+            if runner !== nothing && !istaskdone(runner)
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+                try
+                    wait(runner)
+                catch
+                end
+            elseif server.status != ServerStatus.STOPPED
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+            end
+        end
+    end
 end

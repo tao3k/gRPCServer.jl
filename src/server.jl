@@ -259,6 +259,14 @@ function _clear_accept_task!(server::GRPCServer, task::Task=current_task())
     return nothing
 end
 
+function _accepting_requests(server::GRPCServer)::Bool
+    return server.status == ServerStatus.RUNNING
+end
+
+function _serving_inflight_requests(server::GRPCServer)::Bool
+    return server.status in (ServerStatus.RUNNING, ServerStatus.DRAINING)
+end
+
 function _try_register_connection!(server::GRPCServer, client)::Bool
     lock(server.lock) do
         limit = server.config.max_connections
@@ -308,7 +316,7 @@ function _acquire_request_slot!(
     lock(server.request_admission)
     try
         while true
-            if server.status != ServerStatus.RUNNING
+            if !_accepting_requests(server)
                 return :server_stopping
             elseif !isnothing(deadline) && deadline <= now()
                 return :deadline_exceeded
@@ -604,7 +612,7 @@ function Base.run(server::GRPCServer; block::Bool=true)
         # Wait for shutdown without holding the lock
         # The shutdown_event is a simple Condition that doesn't require a lock
         try
-            while server.status == ServerStatus.RUNNING
+            while server.status != ServerStatus.STOPPED
                 wait(server.shutdown_event)
             end
         catch e
@@ -697,13 +705,13 @@ function accept_loop(server::GRPCServer)
 end
 
 function _plain_accept_loop(server::GRPCServer)
-    while server.status == ServerStatus.RUNNING && server.socket !== nothing
+    while _accepting_requests(server) && server.socket !== nothing
         try
             client = accept(server.socket)
             task = @async handle_connection(server, client)
             _track_connection_task!(server, task)
         catch e
-            if server.status != ServerStatus.RUNNING
+            if !_accepting_requests(server)
                 break  # Expected during shutdown
             end
             @error "Error accepting connection" exception=e
@@ -713,7 +721,7 @@ end
 
 function _tls_accept_loop(server::GRPCServer)
     transport = server.tls_transport
-    while server.status == ServerStatus.RUNNING && isopen(transport)
+    while _accepting_requests(server) && isopen(transport)
         try
             neg = accept_one(transport)
             task = @async handle_connection(server, neg.io)
@@ -722,7 +730,7 @@ function _tls_accept_loop(server::GRPCServer)
             if e isa TLSHandshakeError
                 _log_tls_handshake_error(e)
                 continue
-            elseif server.status != ServerStatus.RUNNING
+            elseif !_accepting_requests(server)
                 break
             else
                 @error "Error accepting TLS connection" exception=e
@@ -775,7 +783,7 @@ function handle_connection(server::GRPCServer, client)
         @debug "Server SETTINGS sent, starting frame processing loop"
 
         # Main frame processing loop
-        while isopen(client) && is_open(conn) && server.status == ServerStatus.RUNNING
+        while isopen(client) && is_open(conn) && _serving_inflight_requests(server)
             @debug "Waiting for next frame..."
             # Read next frame
             frame = read_frame(client)
@@ -1229,6 +1237,17 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             )
             remove_stream(conn, stream_id)
             continue
+        elseif admission == :server_stopping
+            send_error_response(
+                conn,
+                io,
+                stream_id,
+                StatusCode.UNAVAILABLE,
+                "Server is draining and not accepting new requests";
+                content_type=get_response_content_type(stream),
+            )
+            remove_stream(conn, stream_id)
+            continue
         elseif admission != :acquired
             return
         end
@@ -1549,7 +1568,7 @@ function handle_server_streaming(
         end
     end
 
-    if server.status != ServerStatus.RUNNING || !Base.isopen(io) || !can_send(stream)
+    if !_serving_inflight_requests(server) || !Base.isopen(io) || !can_send(stream)
         return nothing
     end
 
@@ -2488,7 +2507,7 @@ function Base.show(io::IO, server::GRPCServer)
 end
 
 function Base.isopen(server::GRPCServer)::Bool
-    return server.status in (ServerStatus.RUNNING, ServerStatus.DRAINING)
+    return _serving_inflight_requests(server)
 end
 
 """

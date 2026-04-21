@@ -399,4 +399,55 @@ end
             @test gRPCServer._request_admission_state(ts.server).queued_requests == 0
         end
     end
+
+    @testset "Graceful Stop Preserves In-Flight Unary Request" begin
+        descriptor = ServiceDescriptor(
+            "test.GracefulDrainService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> begin
+                        sleep(0.4)
+                        return req
+                    end,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server() do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.GracefulDrainService"] = HealthStatus.SERVING
+
+            request_path = "/test.GracefulDrainService/Echo"
+
+            first = @async run_live_unary_request(ts.port, request_path, UInt8[0x0D, 0x0E])
+            @test timedwait(
+                () -> gRPCServer._request_admission_state(ts.server).active_requests == 1,
+                1.0,
+            ) === :ok
+
+            stopper = @async stop!(ts.server; force=false, timeout=2.0)
+            @test timedwait(() -> ts.server.status == ServerStatus.DRAINING, 1.0) === :ok
+            @test timedwait(() -> istaskdone(stopper), 0.2) === :timed_out
+
+            drain_error = try
+                run_live_unary_request(ts.port, request_path, UInt8[0x0F, 0x10])
+                nothing
+            catch err
+                err
+            end
+            @test drain_error !== nothing
+
+            first_result = fetch(first)
+            @test first_result.collector.grpc_status == Int(StatusCode.OK)
+
+            wait(stopper)
+            @test ts.server.status == ServerStatus.STOPPED
+            @test gRPCServer._request_admission_state(ts.server).active_requests == 0
+        end
+    end
 end

@@ -144,6 +144,21 @@ function ack_keepalive_until_closed!(
     end
 end
 
+function keepalive_reuse_unary_roundtrip!(
+    session::LiveHTTP2UnarySession,
+    path::String,
+    payload::Vector{UInt8};
+    pre_request_rounds::Int=2,
+    post_request_rounds::Int=1,
+    timeout::Float64=1.0,
+)
+    ack_keepalive_rounds!(session; rounds=pre_request_rounds, timeout=timeout)
+    stream_id = send_live_unary_request!(session, path, payload)
+    result = await_live_unary_response!(session, stream_id)
+    ack_keepalive_rounds!(session; rounds=post_request_rounds, timeout=timeout)
+    return result
+end
+
 function send_live_unary_request!(
     session::LiveHTTP2UnarySession,
     path::String,
@@ -664,6 +679,65 @@ end
                 if stopper !== nothing && !istaskdone(stopper)
                     wait(stopper)
                 end
+            end
+        end
+    end
+
+    @testset "Unary Reuse Works After Keepalive Cycles On Reused Sessions" begin
+        descriptor = ServiceDescriptor(
+            "test.KeepaliveReuseService",
+            Dict(
+                "Echo" => MethodDescriptor(
+                    "Echo",
+                    MethodType.UNARY,
+                    "test.Request",
+                    "test.Response",
+                    (ctx, req) -> req,
+                ),
+            ),
+            nothing,
+        )
+
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            gRPCServer.register_service!(ts.server.dispatcher, descriptor)
+            ts.server.health_status["test.KeepaliveReuseService"] = HealthStatus.SERVING
+
+            request_path = "/test.KeepaliveReuseService/Echo"
+            session_count = 4
+            sessions = [
+                open_live_http2_unary_session(ts.port) for _ in 1:session_count
+            ]
+            try
+                @test timedwait(() -> length(ts.server.connections) == session_count, 1.0) === :ok
+
+                payloads = [
+                    UInt8[0x21, UInt8(i), UInt8(i + 10)] for i in 1:session_count
+                ]
+                tasks = [
+                    @async keepalive_reuse_unary_roundtrip!(
+                        sessions[i],
+                        request_path,
+                        payloads[i];
+                        pre_request_rounds=2,
+                        post_request_rounds=1,
+                        timeout=1.0,
+                    ) for i in 1:session_count
+                ]
+
+                results = fetch.(tasks)
+                @test length(results) == session_count
+                @test all(
+                    result.collector.grpc_status == Int(StatusCode.OK) for result in results
+                )
+                @test all(
+                    results[i].body == build_grpc_message(payloads[i]) for i in 1:session_count
+                )
+                @test length(ts.server.connections) == session_count
+            finally
+                for session in sessions
+                    close_live_http2_unary_session!(session)
+                end
+                @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
             end
         end
     end

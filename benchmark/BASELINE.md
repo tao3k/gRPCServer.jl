@@ -78,3 +78,17 @@ julia --project=benchmark benchmark/live_unary_soak.jl \
 The soak runner reports aggregate throughput, latency percentiles, graceful
 stop latency, and whether connection and admission state drained cleanly after
 shutdown.
+
+For repeated pressure sweeps such as `16/32/64` concurrency on a fixed Julia
+thread count, use the sweep harness:
+
+```bash
+JULIA_NUM_THREADS=8 julia --project=benchmark benchmark/live_unary_sweep.jl \
+  --concurrency-list 16,32,64 \
+  --rounds 3 \
+  --requests-per-session 32
+```
+
+The sweep runner prints per-round measurements and a final Markdown summary
+table with throughput, latency, and graceful-stop statistics for each
+concurrency level.

@@ -45,6 +45,52 @@ end
         @test server.config.debug_mode == true
     end
 
+    @testset "Connection liveness timeout selection" begin
+        keepalive = gRPCServer.ConnectionKeepaliveState()
+
+        server = GRPCServer(
+            "127.0.0.1",
+            50051;
+            keepalive_interval=2.0,
+            keepalive_timeout=0.5,
+            idle_timeout=5.0,
+        )
+        @test gRPCServer._next_connection_liveness_timeout(server, keepalive) ==
+              (2.0, :keepalive_probe)
+
+        keepalive.pending_ping_payload = UInt8[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        @test gRPCServer._next_connection_liveness_timeout(server, keepalive) ==
+              (0.5, :keepalive_ack)
+
+        keepalive.pending_ping_payload = nothing
+        idle_server = GRPCServer(
+            "127.0.0.1",
+            50052;
+            keepalive_interval=4.0,
+            idle_timeout=1.0,
+        )
+        @test gRPCServer._next_connection_liveness_timeout(idle_server, keepalive) ==
+              (1.0, :idle_timeout)
+
+        unbounded_server = GRPCServer("127.0.0.1", 50053)
+        @test gRPCServer._next_connection_liveness_timeout(unbounded_server, keepalive) ==
+              (nothing, :none)
+    end
+
+    @testset "Keepalive ACK matching" begin
+        keepalive = gRPCServer.ConnectionKeepaliveState(
+            UInt8[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+        )
+
+        ack = PureHTTP2.ping_frame(copy(keepalive.pending_ping_payload); ack=true)
+        nack = PureHTTP2.ping_frame(fill(UInt8(0x00), 8); ack=true)
+        probe = PureHTTP2.ping_frame(copy(keepalive.pending_ping_payload))
+
+        @test gRPCServer._matches_keepalive_ack(keepalive, ack)
+        @test !gRPCServer._matches_keepalive_ack(keepalive, nack)
+        @test !gRPCServer._matches_keepalive_ack(keepalive, probe)
+    end
+
     @testset "HTTP/2 Backend Configuration" begin
         backend = PureHTTP2Backend()
         conn = create_connection(backend)
@@ -314,6 +360,88 @@ end
             if stopper !== nothing && !istaskdone(stopper)
                 try
                     wait(stopper)
+                catch
+                end
+            end
+            if runner !== nothing && !istaskdone(runner)
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+                try
+                    wait(runner)
+                catch
+                end
+            elseif server.status != ServerStatus.STOPPED
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+            end
+        end
+    end
+
+    @testset "Idle timeout closes connections before preface" begin
+        server = GRPCServer("127.0.0.1", test_available_port(); idle_timeout=0.2)
+        client = nothing
+        runner = nothing
+        try
+            runner = @async run(server)
+            @test timedwait(() -> server.status == ServerStatus.RUNNING, 2.0) === :ok
+
+            client = connect(IPv4("127.0.0.1"), server.port)
+            @test timedwait(() -> length(server.connections) == 1, 2.0) === :ok
+            @test timedwait(() -> isempty(server.connections), 1.5) === :ok
+            @test timedwait(() -> isempty(server.connection_tasks), 1.5) === :ok
+        finally
+            if client !== nothing
+                try
+                    close(client)
+                catch
+                end
+            end
+            if runner !== nothing && !istaskdone(runner)
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+                try
+                    wait(runner)
+                catch
+                end
+            elseif server.status != ServerStatus.STOPPED
+                try
+                    stop!(server; force=true, timeout=2.0)
+                catch
+                end
+            end
+        end
+    end
+
+    @testset "Keepalive timeout closes prefaced idle connections without ACK" begin
+        server = GRPCServer(
+            "127.0.0.1",
+            test_available_port();
+            keepalive_interval=0.2,
+            keepalive_timeout=0.2,
+        )
+        client = nothing
+        runner = nothing
+        try
+            runner = @async run(server)
+            @test timedwait(() -> server.status == ServerStatus.RUNNING, 2.0) === :ok
+
+            client = connect(IPv4("127.0.0.1"), server.port)
+            write(client, PureHTTP2.CONNECTION_PREFACE)
+            write(client, PureHTTP2.encode_frame(PureHTTP2.settings_frame()))
+            flush(client)
+
+            @test timedwait(() -> length(server.connections) == 1, 2.0) === :ok
+            @test timedwait(() -> isempty(server.connections), 1.5) === :ok
+        finally
+            if client !== nothing
+                try
+                    close(client)
                 catch
                 end
             end

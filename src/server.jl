@@ -150,6 +150,12 @@ mutable struct GRPCServer
     end
 end
 
+mutable struct ConnectionKeepaliveState
+    pending_ping_payload::Union{Nothing, Vector{UInt8}}
+end
+
+ConnectionKeepaliveState() = ConnectionKeepaliveState(nothing)
+
 """
     register!(server::GRPCServer, service)
 
@@ -774,7 +780,15 @@ function handle_connection(server::GRPCServer, client)
         conn = create_connection(server.http2_backend)
 
         # Read and validate client connection preface
-        preface_data = read_connection_preface(client)
+        preface_data = try
+            read_connection_preface(client; idle_timeout=server.config.idle_timeout)
+        catch e
+            if e isa IdleConnectionTimeoutError
+                @debug "Closing idle connection before preface" peer=peer timeout=e.timeout_seconds
+                return
+            end
+            rethrow()
+        end
         if preface_data === nothing
             @debug "Client disconnected before sending preface"
             return
@@ -796,11 +810,24 @@ function handle_connection(server::GRPCServer, client)
 
         @debug "Server SETTINGS sent, starting frame processing loop"
 
+        keepalive = ConnectionKeepaliveState()
+
         # Main frame processing loop
         while isopen(client) && is_open(conn) && _serving_inflight_requests(server)
             @debug "Waiting for next frame..."
             # Read next frame
-            frame = read_frame(client)
+            frame = try
+                _read_connection_frame!(server, client, keepalive)
+            catch e
+                if e isa IdleConnectionTimeoutError
+                    @debug "Closing idle connection after inactivity" peer=peer timeout=e.timeout_seconds
+                    break
+                elseif e isa KeepaliveTimeoutError
+                    @debug "Closing connection after missed keepalive ACK" peer=peer timeout=e.timeout_seconds
+                    break
+                end
+                rethrow()
+            end
             if frame === nothing
                 @debug "read_frame returned nothing, breaking loop"
                 break  # Connection closed
@@ -860,28 +887,230 @@ end
 Read exactly n bytes from io into buf. Returns the number of bytes read.
 Throws EOFError if connection is closed before reading n bytes.
 """
-function read_exactly!(io::IO, buf::Vector{UInt8}, n::Int)::Int
+struct IdleConnectionTimeoutError <: Exception
+    timeout_seconds::Float64
+end
+
+struct KeepaliveTimeoutError <: Exception
+    timeout_seconds::Float64
+end
+
+function Base.showerror(io::IO, err::IdleConnectionTimeoutError)
+    print(io, "idle connection timed out after ", err.timeout_seconds, " seconds")
+    return nothing
+end
+
+function Base.showerror(io::IO, err::KeepaliveTimeoutError)
+    print(io, "keepalive probe timed out after ", err.timeout_seconds, " seconds")
+    return nothing
+end
+
+@inline function _idle_timeout_deadline_ns(timeout_seconds::Float64)::Int64
+    return time_ns() + ceil(Int64, timeout_seconds * 1.0e9)
+end
+
+function _next_connection_liveness_timeout(
+    server::GRPCServer,
+    keepalive::ConnectionKeepaliveState,
+)::Tuple{Union{Nothing, Float64}, Symbol}
+    if keepalive.pending_ping_payload !== nothing
+        return (server.config.keepalive_timeout, :keepalive_ack)
+    end
+
+    keepalive_interval = server.config.keepalive_interval
+    idle_timeout = server.config.idle_timeout
+
+    if !isnothing(keepalive_interval) &&
+       (isnothing(idle_timeout) || keepalive_interval <= idle_timeout)
+        return (keepalive_interval, :keepalive_probe)
+    elseif !isnothing(idle_timeout)
+        return (idle_timeout, :idle_timeout)
+    end
+
+    return (nothing, :none)
+end
+
+function _next_keepalive_payload()::Vector{UInt8}
+    nonce = UInt64(time_ns())
+    payload = Vector{UInt8}(undef, 8)
+    for (idx, shift) in enumerate(56:-8:0)
+        payload[idx] = UInt8((nonce >> shift) & 0xff)
+    end
+    return payload
+end
+
+function _start_keepalive_probe!(
+    io::IO,
+    keepalive::ConnectionKeepaliveState,
+)::Vector{UInt8}
+    payload = _next_keepalive_payload()
+    keepalive.pending_ping_payload = payload
+    write_frame(io, ping_frame(payload))
+    return payload
+end
+
+function _clear_keepalive_probe!(keepalive::ConnectionKeepaliveState)
+    keepalive.pending_ping_payload = nothing
+    return nothing
+end
+
+function _matches_keepalive_ack(
+    keepalive::ConnectionKeepaliveState,
+    frame::Frame,
+)::Bool
+    payload = keepalive.pending_ping_payload
+    payload === nothing && return false
+    return frame.header.frame_type == FrameType.PING &&
+           has_flag(frame.header, FrameFlags.ACK) &&
+           frame.payload == payload
+end
+
+function _arm_read_deadline!(::IO, ::Nothing)
+    return nothing
+end
+
+function _arm_read_deadline!(::IO, ::Float64)
+    return nothing
+end
+
+function _arm_read_deadline!(conn::Reseau.TCP.Conn, timeout_seconds::Float64)
+    Reseau.TCP.set_read_deadline!(conn, _idle_timeout_deadline_ns(timeout_seconds))
+    return nothing
+end
+
+function _arm_read_deadline!(conn::Reseau.TLS.Conn, timeout_seconds::Float64)
+    Reseau.TLS.set_read_deadline!(conn, _idle_timeout_deadline_ns(timeout_seconds))
+    return nothing
+end
+
+function _clear_read_deadline!(::IO, ::Nothing)
+    return nothing
+end
+
+function _clear_read_deadline!(::IO, ::Float64)
+    return nothing
+end
+
+function _clear_read_deadline!(conn::Reseau.TCP.Conn, ::Float64)
+    Reseau.TCP.set_read_deadline!(conn, 0)
+    return nothing
+end
+
+function _clear_read_deadline!(conn::Reseau.TLS.Conn, ::Float64)
+    Reseau.TLS.set_read_deadline!(conn, 0)
+    return nothing
+end
+
+@inline function _is_idle_timeout_error(::Exception, ::Nothing)::Bool
+    return false
+end
+
+@inline function _is_idle_timeout_error(err::Exception, ::Float64)::Bool
+    return err isa Reseau.TCP.DeadlineExceededError ||
+           (err isa Reseau.TLS.TLSError && err.cause isa Reseau.TLS.DeadlineExceededError)
+end
+
+function _read_tcpsocket_chunk!(
+    io::TCPSocket,
+    buf::Vector{UInt8},
+    offset::Int,
+    n::Int,
+    idle_timeout::Float64,
+)::Int
+    read_ready() = begin
+        status = getfield(io, :status)
+        return bytesavailable(io) > 0 ||
+               getfield(io, :readerror) !== nothing ||
+               status == Base.StatusEOF ||
+               status == Base.StatusClosing ||
+               status == Base.StatusClosed
+    end
+
+    if !read_ready()
+        Base.start_reading(io)
+        try
+            wait_status = timedwait(read_ready, idle_timeout; pollint=min(idle_timeout / 10, 0.01))
+            wait_status === :timed_out && throw(IdleConnectionTimeoutError(idle_timeout))
+        finally
+            Base.stop_reading(io)
+        end
+    end
+
+    readerror = getfield(io, :readerror)
+    readerror !== nothing && throw(readerror)
+
+    available = bytesavailable(io)
+    if available == 0
+        return 0
+    end
+
+    bytes_to_copy = min(available, n)
+    return readbytes!(getfield(io, :buffer), view(buf, offset:(offset + bytes_to_copy - 1)), bytes_to_copy)
+end
+
+function read_exactly!(
+    io::TCPSocket,
+    buf::Vector{UInt8},
+    n::Int;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Int
     total_read = 0
     while total_read < n
-        bytes_read = readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
-        if bytes_read == 0
-            throw(EOFError())
+        bytes_read = if isnothing(idle_timeout)
+            readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
+        else
+            _read_tcpsocket_chunk!(io, buf, total_read + 1, n - total_read, idle_timeout)
         end
+        bytes_read == 0 && throw(EOFError())
         total_read += bytes_read
     end
     return total_read
 end
 
+function read_exactly!(
+    io::IO,
+    buf::Vector{UInt8},
+    n::Int;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Int
+    total_read = 0
+    while total_read < n
+        _arm_read_deadline!(io, idle_timeout)
+        try
+            bytes_read = if isnothing(idle_timeout)
+                readbytes!(io, view(buf, (total_read + 1):n), n - total_read)
+            else
+                readbytes!(io, view(buf, (total_read + 1):n), n - total_read; all=false)
+            end
+            if bytes_read == 0
+                throw(EOFError())
+            end
+            total_read += bytes_read
+        catch err
+            if _is_idle_timeout_error(err, idle_timeout)
+                throw(IdleConnectionTimeoutError(Float64(something(idle_timeout, 0.0))))
+            end
+            rethrow()
+        finally
+            _clear_read_deadline!(io, idle_timeout)
+        end
+    end
+    return total_read
+end
+
 """
-    read_connection_preface(io::IO) -> Union{Vector{UInt8}, Nothing}
+    read_connection_preface(io::IO; idle_timeout=nothing) -> Union{Vector{UInt8}, Nothing}
 
 Read the HTTP/2 connection preface from a client.
 Returns the preface bytes, or nothing if the connection was closed.
 """
-function read_connection_preface(io::IO)::Union{Vector{UInt8}, Nothing}
+function read_connection_preface(
+    io::IO;
+    idle_timeout::Union{Nothing, Float64}=nothing,
+)::Union{Vector{UInt8}, Nothing}
     try
         preface = Vector{UInt8}(undef, length(CONNECTION_PREFACE))
-        n = read_exactly!(io, preface, length(CONNECTION_PREFACE))
+        n = read_exactly!(io, preface, length(CONNECTION_PREFACE); idle_timeout=idle_timeout)
         @debug "Read connection preface" n=n expected=length(CONNECTION_PREFACE) preface_hex=bytes2hex(preface[1:n]) expected_hex=bytes2hex(CONNECTION_PREFACE)
         return preface
     catch e
@@ -894,22 +1123,22 @@ function read_connection_preface(io::IO)::Union{Vector{UInt8}, Nothing}
 end
 
 """
-    read_frame(io::IO) -> Union{Frame, Nothing}
+    read_frame(io::IO; idle_timeout=nothing) -> Union{Frame, Nothing}
 
 Read an HTTP/2 frame from the connection.
 Returns the frame, or nothing if the connection was closed.
 """
-function read_frame(io::IO)::Union{Frame, Nothing}
+function read_frame(io::IO; idle_timeout::Union{Nothing, Float64}=nothing)::Union{Frame, Nothing}
     try
         # Read 9-byte frame header
         header_bytes = Vector{UInt8}(undef, FRAME_HEADER_SIZE)
-        read_exactly!(io, header_bytes, FRAME_HEADER_SIZE)
+        read_exactly!(io, header_bytes, FRAME_HEADER_SIZE; idle_timeout=idle_timeout)
         header = decode_frame_header(header_bytes)
 
         # Read payload
         payload = if header.length > 0
             buf = Vector{UInt8}(undef, header.length)
-            read_exactly!(io, buf, Int(header.length))
+            read_exactly!(io, buf, Int(header.length); idle_timeout=idle_timeout)
             buf
         else
             UInt8[]
@@ -921,6 +1150,36 @@ function read_frame(io::IO)::Union{Frame, Nothing}
             return nothing
         end
         rethrow()
+    end
+end
+
+function _read_connection_frame!(
+    server::GRPCServer,
+    io::IO,
+    keepalive::ConnectionKeepaliveState,
+)::Union{Frame, Nothing}
+    while true
+        timeout_seconds, timeout_kind = _next_connection_liveness_timeout(server, keepalive)
+        frame = try
+            read_frame(io; idle_timeout=timeout_seconds)
+        catch err
+            if err isa IdleConnectionTimeoutError
+                if timeout_kind == :keepalive_probe
+                    _start_keepalive_probe!(io, keepalive)
+                    continue
+                elseif timeout_kind == :keepalive_ack
+                    throw(KeepaliveTimeoutError(server.config.keepalive_timeout))
+                end
+            end
+            rethrow()
+        end
+
+        frame === nothing && return nothing
+
+        if _matches_keepalive_ack(keepalive, frame)
+            _clear_keepalive_probe!(keepalive)
+        end
+        return frame
     end
 end
 

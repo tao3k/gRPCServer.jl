@@ -68,6 +68,35 @@ function close_live_http2_unary_session!(session::LiveHTTP2UnarySession)
     return nothing
 end
 
+function await_server_ping!(
+    session::LiveHTTP2UnarySession;
+    timeout::Float64=1.0,
+)
+    deadline = time() + timeout
+    while time() < deadline
+        frame_timeout = max(deadline - time(), 0.05)
+        frame = try
+            gRPCServer.read_frame(session.tcp; idle_timeout=frame_timeout)
+        catch err
+            if err isa gRPCServer.IdleConnectionTimeoutError
+                continue
+            end
+            rethrow()
+        end
+        frame === nothing && error("Transport EOF before keepalive ping arrived")
+        if frame.header.frame_type == PureHTTP2.FrameType.PING &&
+           !PureHTTP2.has_flag(frame.header, PureHTTP2.FrameFlags.ACK)
+            return frame
+        end
+    end
+    error("Timed out waiting for server keepalive ping")
+end
+
+function ack_server_ping!(session::LiveHTTP2UnarySession, ping::PureHTTP2.Frame)
+    gRPCServer.write_frame(session.tcp, PureHTTP2.ping_frame(ping.payload; ack=true))
+    return nothing
+end
+
 function send_live_unary_request!(
     session::LiveHTTP2UnarySession,
     path::String,
@@ -454,6 +483,52 @@ end
             @test isempty(ts.server.connections)
 
             disconnect!(blocker)
+        end
+    end
+
+    @testset "Idle Timeout Closes Prefaced Idle Connection" begin
+        with_test_server(idle_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+                @test timedwait(() -> isempty(ts.server.connections), 1.5) === :ok
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.5) === :ok
+            finally
+                close_live_http2_unary_session!(session)
+            end
+        end
+    end
+
+    @testset "Keepalive Timeout Closes Prefaced Idle Connection" begin
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+                @test timedwait(() -> isempty(ts.server.connections), 1.5) === :ok
+                @test timedwait(() -> isempty(ts.server.connection_tasks), 1.5) === :ok
+            finally
+                close_live_http2_unary_session!(session)
+            end
+        end
+    end
+
+    @testset "Keepalive ACK Preserves Prefaced Idle Connection" begin
+        with_test_server(keepalive_interval=0.2, keepalive_timeout=0.2) do ts
+            session = open_live_http2_unary_session(ts.port)
+            try
+                @test timedwait(() -> length(ts.server.connections) == 1, 1.0) === :ok
+
+                first_ping = await_server_ping!(session; timeout=1.0)
+                ack_server_ping!(session, first_ping)
+                @test length(ts.server.connections) == 1
+
+                second_ping = await_server_ping!(session; timeout=1.0)
+                ack_server_ping!(session, second_ping)
+                @test length(ts.server.connections) == 1
+            finally
+                close_live_http2_unary_session!(session)
+                @test timedwait(() -> isempty(ts.server.connections), 1.0) === :ok
+            end
         end
     end
 

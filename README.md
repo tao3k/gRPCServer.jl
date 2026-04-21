@@ -36,7 +36,10 @@ incoming `grpc-timeout` deadline while waiting for server capacity. A graceful
 `stop!(server; force=false)` closes the listener, keeps admitted requests alive
 through drain, closes remaining idle connections once in-flight requests are
 finished, and refuses new work while the server is draining, including new
-streams opened on existing HTTP/2 connections.
+streams opened on existing HTTP/2 connections. `keepalive_interval` and
+`keepalive_timeout` are also runtime-owned: when `keepalive_interval` wins the
+next idle wait, the server emits a connection-level HTTP/2 PING and closes the
+connection if the matching ACK is not received before `keepalive_timeout`.
 
 ## Related Packages
 
